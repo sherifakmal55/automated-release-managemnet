@@ -1,0 +1,12 @@
+version: 0.2
+
+phases:
+  build:
+    commands:
+      - echo "Gate execution started"
+      - echo "NEED_APPROVAL=$NEED_APPROVAL"
+      - '[ "$NEED_APPROVAL" = "false" ] && exit 1 || exit 0'
+
+artifacts:
+  files:
+    - "**/*"

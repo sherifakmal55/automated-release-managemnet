@@ -1,0 +1,306 @@
+version: 0.2
+
+env:
+  variables:
+    WAR_SSM_TIMEOUT_SECS: "3600"
+    # Optionally override client: set CLIENT_NAME when starting the build (CodeBuild env var).
+    # CLIENT_NAME: "westpac-bt"
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.11
+    commands:
+      - echo "📦 Installing dependencies..."
+      - yum install -y jq awscli
+      - echo "✅ Install complete"
+
+  build:
+    commands:
+        
+      - |  
+        exec > >(stdbuf -oL tee -a /tmp/build.log) 2>&1
+        echo STAGE_NAME=$STAGE_NAME
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [BUILD]📥 Reading task.json from SSM using JIRA_ID=$JIRA_ID"
+        TASK_PARAM_PATH="/rm-flow-controller/${JIRA_ID}/task.json"
+      
+        echo "🔎 SSM path: $TASK_PARAM_PATH"
+      
+        TASK_JSON="$(aws ssm get-parameter \
+          --name "$TASK_PARAM_PATH" \
+          --with-decryption \
+          --query 'Parameter.Value' \
+          --output text \
+          --region eu-west-1)" || true
+        if [[ -z "$TASK_JSON" || "$TASK_JSON" == "None" ]]; then
+          echo "❌ Empty SSM value for $TASK_PARAM_PATH"; exit 1
+        fi
+        printf '%s\n' "$TASK_JSON" > task.json
+        echo "✅ Saved to task.json"; jq . task.json || cat task.json
+
+        # 2) basics + Parameter Store (collect WAR tasks BEFORE assume-role)
+      
+        echo "📌 Extracting metadata..."
+        CLIENT=$(jq -r '.client' task.json)
+        ENV=$(jq -r '.env' task.json)
+        JIRA_ID=$(jq -r '.jira_ticket' task.json)
+        echo "✅ Fields: CLIENT=${CLIENT} ENV=${ENV} JIRA=${JIRA_ID} TASK_INDEX=${TASK_INDEX:-<unset>} TIMEOUT=${WAR_SSM_TIMEOUT_SECS}s"
+
+        # Allow external override of client via CodeBuild env var CLIENT_NAME
+        if [[ -n "${CLIENT_NAME:-}" && "${CLIENT_NAME:-}" != "null" ]]; then
+          echo "ℹ️ CLIENT override detected (CLIENT_NAME env var) -> using: ${CLIENT_NAME}"
+          USE_CLIENT="${CLIENT_NAME}"
+        else
+          USE_CLIENT="${CLIENT}"
+          echo "ℹ️ Using client from task.json -> ${USE_CLIENT}"
+        fi
+
+        echo "📥 Fetching Parameter Store metadata..."
+        PARAM_PATH="/arm-cpr/$CLIENT/$ENV/details.json"
+        PARAM_JSON=$(aws ssm get-parameter --name "$PARAM_PATH" --with-decryption --query 'Parameter.Value' --output text)
+        echo "$PARAM_JSON" | jq . >/dev/null
+        echo "✅ Parameter JSON fetched"
+
+        JBOSS_PATH=$(echo "$PARAM_JSON" | jq -r '.wildfly_details.jboss_path')
+        JAVA_PATH=$(echo "$PARAM_JSON" | jq -r '.wildfly_details.java_path')
+        MGMT_PORT=$(echo "$PARAM_JSON" | jq -r '.wildfly_details.jbosscli_port')
+        JBOSS_USER=$(echo "$PARAM_JSON" | jq -r '.wildfly_details.jboss_user')
+
+        REGION=$(echo "$PARAM_JSON" | jq -r '.region')
+        ROLE_ARN=$(echo "$PARAM_JSON" | jq -r '.assume_role_arn')
+        if [[ -z "$REGION" || "$REGION" == "null" || -z "$ROLE_ARN" || "$ROLE_ARN" == "null" ]]; then
+          echo "❌ region/assume_role_arn missing in Parameter Store"; exit 1
+        fi
+        echo "✅ REGION=$REGION and ROLE_ARN present"
+
+        # 3) Build WAR task list (consistent paths; NO delete)
+      
+        echo "🎭 Building WAR task list (TASK_INDEX=${TASK_INDEX:-<unset>})..."
+        SRC_BASE="/tmp/${JIRA_ID}/client-packages/${JIRA_ID}/deploy"
+        if [[ -n "${TASK_INDEX:-}" ]]; then
+          jq -n \
+            --argjson t "$(cat task.json)" \
+            --argjson p "$PARAM_JSON" \
+            --arg      j "$JIRA_ID" \
+            --arg      sb "$SRC_BASE" '
+              [
+                $t.deploy[$ENV.TASK_INDEX|tonumber]
+                | select(.task_type | test("^WarDeployment"; "i"))
+                | {
+                    comp:        ((.server_name // .server) | ascii_downcase),
+                    file_name:   (.file_name // .war_to_backup // ""),
+                    target_path: (.target_path // ""),
+                    iid:         ($p.Instance_mappings[((.server_name // .server | ascii_downcase) + "_instance_id")] // ""),
+                    src_path:    ($sb + "/" + (.file_name // .war_to_backup // "")),
+                    dest_dir:    ((.target_path // "") + "/" + $j),
+                    dest_path:   ((.target_path // "") + "/" + $j + "/" + (.file_name // .war_to_backup // ""))
+                  }
+                | select(.comp != "" and .file_name != "" and .iid != "" and .src_path != "" and .target_path != "" and .dest_dir != "" and .dest_path != "")
+              ]
+            ' > war_tasks_exec.json
+        else
+          jq -n \
+            --argjson t "$(cat task.json)" \
+            --argjson p "$PARAM_JSON" \
+            --arg      j "$JIRA_ID" \
+            --arg      sb "$SRC_BASE" '
+              [
+                $t.deploy[]
+                | select(.task_type | test("^WarDeployment"; "i"))
+                | {
+                    comp:        ((.server_name // .server) | ascii_downcase),
+                    file_name:   (.file_name // .war_to_backup // ""),
+                    target_path: (.target_path // ""),
+                    iid:         ($p.Instance_mappings[((.server_name // .server | ascii_downcase) + "_instance_id")] // ""),
+                    src_path:    ($sb + "/" + (.file_name // .war_to_backup // "")),
+                    dest_dir:    ((.target_path // "") + "/" + $j),
+                    dest_path:   ((.target_path // "") + "/" + $j + "/" + (.file_name // .war_to_backup // ""))
+                  }
+                | select(.comp != "" and .file_name != "" and .iid != "" and .src_path != "" and .target_path != "" and .dest_dir != "" and .dest_path != "")
+              ]
+            ' > war_tasks_exec.json
+        fi
+
+        echo "📄 WAR tasks (ready):"; jq . war_tasks_exec.json
+        WAR_READY=$(jq 'length' war_tasks_exec.json)
+        echo "✅ WAR tasks ready for execution: ${WAR_READY}"
+        if [[ "$WAR_READY" -eq 0 ]]; then
+          echo "❌ No valid WAR task(s). Check TASK_INDEX and JSON."; exit 1
+        fi
+
+        # 4) Assume role
+        echo "🔐 Assuming client account role..."
+      
+        CREDS=$(aws sts assume-role --role-arn "$ROLE_ARN" --role-session-name WarDeploySession --region "$REGION")
+        export AWS_ACCESS_KEY_ID=$(echo "$CREDS" | jq -r '.Credentials.AccessKeyId')
+        export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r '.Credentials.SecretAccessKey')
+        export AWS_SESSION_TOKEN=$(echo "$CREDS" | jq -r '.Credentials.SessionToken')
+        echo "✅ AssumeRole success"
+
+        # 5) SSM: mkdir JIRA subdir, copy WAR (NO delete), run deploy-war.sh, wait + logs
+      
+        echo "🚀 Executing WAR deployments via SSM (no delete in target dir)…"
+        SUCCESS_LIST=""
+        FAILURE_LIST=""
+
+        while IFS= read -r ROW; do
+          COMP=$(echo "$ROW" | jq -r '.comp')
+          APP_NAME=$(echo "$ROW" | jq -r '.file_name')
+          IID=$(echo "$ROW" | jq -r '.iid')
+          SRC_PATH=$(echo "$ROW" | jq -r '.src_path')
+          TARGET_DIR=$(echo "$ROW" | jq -r '.dest_dir')
+          DEST_PATH=$(echo "$ROW" | jq -r '.dest_path')
+          ROOT_DIR=$(echo "$ROW" | jq -r '.target_path')
+
+          USE_CLIENT=${USE_CLIENT:-${CLIENT}}
+
+          SCRIPT_PATH="/tmp/${JIRA_ID}/scripts/deploy-war.sh"
+
+          echo "----------------------------------------"
+          echo "🏷️  Component: $COMP"
+          echo "📦 App/WAR:   $APP_NAME"
+          echo "🖥️  Instance: $IID"
+          echo "📄 Source:    $SRC_PATH"
+          echo "📁 TargetDir: $TARGET_DIR"
+          echo "📄 DestPath:  $DEST_PATH"
+          echo "📄 Jira_ID:  $JIRA_ID"
+          echo "📄 JBOSS_Path:  $JBOSS_PATH"
+          echo "📄 JAVA_PATH:  $JAVA_PATH"
+          echo "📄 MGMT_PORT:  $MGMT_PORT"
+          echo "📜 Jboss_User: $JBOSS_USER"
+          echo "📜 Script:    $SCRIPT_PATH"
+          echo "🔁 Client used for deploy: ${USE_CLIENT}"
+          echo "⏱️  Timeout:  ${WAR_SSM_TIMEOUT_SECS}s"
+
+          SAFE_GUARD=$(printf 'case %q in ("/"|"") echo "Refusing to operate on empty/root target_path"; exit 99;; esac' "$ROOT_DIR")
+
+          CMD0=$(printf 'set -euo pipefail; %s; if [ ! -x %q ]; then echo "deploy-war.sh not found/executable at %s"; exit 1; fi' "$SAFE_GUARD" "$SCRIPT_PATH" "$SCRIPT_PATH")
+          CMD1=$(printf 'set -euo pipefail; sudo mkdir -p %q' "$TARGET_DIR")
+          CMD2=$(printf 'set -euo pipefail; echo "📂 Before copy:"; ls -la %q || true' "$ROOT_DIR")
+          CMD3=$(printf 'set -euo pipefail; if [ ! -f %q ]; then echo "WAR not found at %s"; exit 1; fi; sudo cp -f %q %q' "$SRC_PATH" "$SRC_PATH" "$SRC_PATH" "$DEST_PATH")
+          CMD4=$(printf 'set -euo pipefail; echo "📂 After copy:"; ls -la %q || true' "$ROOT_DIR")
+          CMD5=$(printf 'set -euo pipefail; echo "🚀 Deploying…"; sudo bash %q %q %q %q %q %q %q %q' "$SCRIPT_PATH" "$APP_NAME" "$DEST_PATH" "$JIRA_ID" "$JBOSS_PATH" "$JAVA_PATH" "$MGMT_PORT" "$JBOSS_USER")
+
+          jq -n \
+            --arg c0 "$CMD0" \
+            --arg c1 "$CMD1" \
+            --arg c2 "$CMD2" \
+            --arg c3 "$CMD3" \
+            --arg c4 "$CMD4" \
+            --arg c5 "$CMD5" \
+            --arg t  "$WAR_SSM_TIMEOUT_SECS" \
+            '{commands: [$c0,$c1,$c2,$c3,$c4,$c5], executionTimeout: [$t] }' > commands_deploy.json
+
+          CMD_ID=$(aws ssm send-command \
+            --region "$REGION" \
+            --document-name "AWS-RunShellScript" \
+            --instance-ids "$IID" \
+            --comment "WAR deploy: '"$APP_NAME"' ('"$COMP"')" \
+            --parameters file://commands_deploy.json \
+            --query "Command.CommandId" \
+            --output text)
+
+          if [[ -z "$CMD_ID" || "$CMD_ID" == "None" ]]; then
+            echo "❌ Failed to start SSM command for $APP_NAME on $IID"
+            FAILURE_LIST="${FAILURE_LIST}\n${COMP}:${APP_NAME} (send-command failed)"
+            continue
+          fi
+
+          echo "⏳ Waiting for SSM (CommandId=$CMD_ID)…"
+
+          # Polling loop: wait up to WAR_SSM_TIMEOUT_SECS for a terminal state
+          START_TS=$(date +%s)
+          TIMEOUT_SECONDS=${WAR_SSM_TIMEOUT_SECS}
+          POLL_INTERVAL=15
+          TERMINAL_STATUS=""
+          while true; do
+            CUR_TS=$(date +%s)
+            ELAPSED=$((CUR_TS - START_TS))
+            if [[ $ELAPSED -ge $TIMEOUT_SECONDS ]]; then
+              echo "⚠️ Timeout reached (${TIMEOUT_SECONDS}s) waiting for SSM command."
+              TERMINAL_STATUS="TimedOut"
+              break
+            fi
+
+            STATUS=$(aws ssm list-command-invocations \
+              --region "$REGION" \
+              --command-id "$CMD_ID" \
+              --instance-id "$IID" \
+              --details \
+              --query "CommandInvocations[0].Status" \
+              --output text 2>/dev/null || echo "Unknown")
+
+            # Standard terminal statuses: Success, Failed, Cancelled, TimedOut, DeliveryTimedOut
+            if [[ "$STATUS" == "Success" || "$STATUS" == "Failed" || "$STATUS" == "Cancelled" || "$STATUS" == "TimedOut" || "$STATUS" == "DeliveryTimedOut" ]]; then
+              TERMINAL_STATUS="$STATUS"
+              break
+            fi
+
+            echo "  ⏳ Current SSM status: $STATUS (elapsed ${ELAPSED}s) — sleeping ${POLL_INTERVAL}s..."
+            sleep $POLL_INTERVAL
+          done
+
+          # Fetch outputs (stdout/stderr) regardless
+          STDOUT=$(aws ssm get-command-invocation \
+            --region "$REGION" \
+            --command-id "$CMD_ID" \
+            --instance-id "$IID" \
+            --query "StandardOutputContent" \
+            --output text 2>/dev/null || echo "")
+          STDERR=$(aws ssm get-command-invocation \
+            --region "$REGION" \
+            --command-id "$CMD_ID" \
+            --instance-id "$IID" \
+            --query "StandardErrorContent" \
+            --output text 2>/dev/null || echo "")
+
+          echo "🪵 STDOUT:"; printf '%s\n' "$STDOUT"
+          echo "🪵 STDERR:"; printf '%s\n' "$STDERR"
+          echo "📄 Final Status: ${TERMINAL_STATUS:-$STATUS}"
+
+          # Decide result
+          if [[ "$TERMINAL_STATUS" != "Success" ]]; then
+            echo "❌ Failure: ${COMP}:${APP_NAME} (status=${TERMINAL_STATUS:-$STATUS})"
+            FAILURE_LIST="${FAILURE_LIST}\n${COMP}:${APP_NAME} (status=${TERMINAL_STATUS:-$STATUS})"
+          elif echo "$STDERR" | grep -Eiq 'error|failed|exception|traceback'; then
+            echo "❌ Failure: ${COMP}:${APP_NAME} (stderr indicates error)"
+            FAILURE_LIST="${FAILURE_LIST}\n${COMP}:${APP_NAME} (stderr error)"
+          else
+            echo "✅ Success: ${COMP}:${APP_NAME}"
+            SUCCESS_LIST="${SUCCESS_LIST}\n${COMP}:${APP_NAME}"
+          fi
+
+        done < <(jq -c '.[]' war_tasks_exec.json)
+
+        echo "========================================"
+        echo "🎯 WAR Deployment Summary (JIRA=${JIRA_ID})"
+        printf '✅ Successful:\n%s\n' "${SUCCESS_LIST:-<none>}"
+        printf '❌ Failed:\n%s\n' "${FAILURE_LIST:-<none>}"
+        echo "========================================"
+
+        if [[ -n "${FAILURE_LIST// }" ]]; then
+          exit 1
+        fi
+
+  post_build:
+    commands:
+      - |
+        echo "Resetting AWS credentials to CodeBuild role..."
+
+        unset AWS_ACCESS_KEY_ID
+        unset AWS_SECRET_ACCESS_KEY
+        unset AWS_SESSION_TOKEN
+        
+        exec > >(stdbuf -oL tee -a /tmp/build.log) 2>&1
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [POST_BUILD] UPLOADING_LOGS"
+
+        # Use parent execution ID if passed, otherwise use own
+        EXEC_FOLDER="${PARENT_EXECUTION_ID:-$PIPELINE_EXECUTION_ID}"
+
+        S3_PATH="s3://nonprod-release-management-codebuild-logs/pipeline-logs/$EXEC_FOLDER/$STAGE_NAME/build.log"
+        aws s3 cp /tmp/build.log "$S3_PATH"
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [POST_BUILD] LOGS_UPLOADED_TO=$S3_PATH"
+
+artifacts:
+  files:
+    - '**/*'

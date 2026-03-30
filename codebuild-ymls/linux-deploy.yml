@@ -1,0 +1,279 @@
+version: 0.2
+
+env:
+  variables:
+    LINUX_SSM_TIMEOUT_SECS: "3600"
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.11
+    commands:
+      - echo "📦 Installing dependencies..."
+      - yum install -y jq awscli
+      - echo "✅ Install complete"
+
+  build:
+    commands:
+      - |  
+        exec > >(stdbuf -oL tee -a /tmp/build.log) 2>&1
+        echo STAGE_NAME=$STAGE_NAME
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [BUILD]📥 Reading task.json from SSM using JIRA_ID=$JIRA_ID"
+        TASK_PARAM_PATH="/rm-flow-controller/${JIRA_ID}/task.json"
+      
+        echo "🔎 SSM path: $TASK_PARAM_PATH"
+      
+        TASK_JSON="$(aws ssm get-parameter \
+          --name "$TASK_PARAM_PATH" \
+          --with-decryption \
+          --query 'Parameter.Value' \
+          --output text \
+          --region eu-west-1)" || true
+        if [[ -z "$TASK_JSON" || "$TASK_JSON" == "None" ]]; then
+          echo "❌ Empty SSM value for $TASK_PARAM_PATH"; exit 1
+        fi
+        printf '%s\n' "$TASK_JSON" > task.json
+        echo "✅ Saved to task.json"; jq . task.json || cat task.json
+
+        # 2) Basics + Parameter Store (collect LINUX tasks BEFORE assume-role)
+      
+        echo "📌 Extracting metadata..."
+        CLIENT=$(jq -r '.client' task.json)
+        ENV=$(jq -r '.env' task.json)
+        JIRA_ID=$(jq -r '.jira_ticket' task.json)
+        echo "✅ Fields: CLIENT=${CLIENT} ENV=${ENV} JIRA=${JIRA_ID} TASK_INDEX=${TASK_INDEX:-<unset>} TIMEOUT=${LINUX_SSM_TIMEOUT_SECS}s"
+
+        echo "📥 Fetching Parameter Store metadata..."
+        PARAM_PATH="/arm-cpr/$CLIENT/$ENV/details.json"
+        PARAM_JSON=$(aws ssm get-parameter --name "$PARAM_PATH" --with-decryption --query 'Parameter.Value' --output text)
+        echo "$PARAM_JSON" | jq . >/dev/null
+        echo "✅ Parameter JSON fetched"
+
+        REGION=$(echo "$PARAM_JSON" | jq -r '.region')
+        ROLE_ARN=$(echo "$PARAM_JSON" | jq -r '.assume_role_arn')
+        if [[ -z "$REGION" || "$REGION" == "null" || -z "$ROLE_ARN" || "$ROLE_ARN" == "null" ]]; then
+          echo "❌ region/assume_role_arn missing in Parameter Store"; exit 1
+        fi
+        echo "✅ REGION=$REGION and ROLE_ARN present"
+
+        # 3) Build LINUX task list (use target_path as-is; NO JIRA subfolder)
+      
+        echo "🐧 Building LINUX task list (TASK_INDEX=${TASK_INDEX:-<unset>})..."
+        SRC_BASE="/tmp/${JIRA_ID}/client-packages/${JIRA_ID}/deploy"
+
+        if [[ -n "${TASK_INDEX:-}" ]]; then
+          jq -n \
+            --argjson t "$(cat task.json)" \
+            --argjson p "$PARAM_JSON" \
+            --arg      sb "$SRC_BASE" '
+              [
+                $t.deploy[$ENV.TASK_INDEX|tonumber]
+                | select((.task_type // "") | test("^Linux"; "i"))
+                | {
+                    comp:        ((.server_name // .server) | ascii_downcase),
+                    file_name:   (.file_name // ""),
+                    target_path: (.target_path // ""),
+                    iid:         ($p.Instance_mappings[((.server_name // .server | ascii_downcase) + "_instance_id")]
+                                  // $p.task_type_mappings.linuxpackages_instance_id // ""),
+                    src_path:    ($sb + "/" + (.file_name // "")),
+                    dest_dir:    (.target_path // ""),                                   # <-- use as-is
+                    dest_path:   ((.target_path // "") + "/" + (.file_name // ""))       # <-- no JIRA suffix
+                  }
+                | select(.comp != "" and .file_name != "" and .iid != "" and .src_path != "" and .target_path != "" and .dest_dir != "" and .dest_path != "")
+              ]
+            ' > linux_tasks_exec.json
+        else
+          jq -n \
+            --argjson t "$(cat task.json)" \
+            --argjson p "$PARAM_JSON" \
+            --arg      sb "$SRC_BASE" '
+              [
+                $t.deploy[]
+                | select((.task_type // "") | test("^Linux"; "i"))
+                | {
+                    comp:        ((.server_name // .server) | ascii_downcase),
+                    file_name:   (.file_name // ""),
+                    target_path: (.target_path // ""),
+                    iid:         ($p.Instance_mappings[((.server_name // .server | ascii_downcase) + "_instance_id")]
+                                  // $p.task_type_mappings.linuxpackages_instance_id // ""),
+                    src_path:    ($sb + "/" + (.file_name // "")),
+                    dest_dir:    (.target_path // ""),                                   # <-- use as-is
+                    dest_path:   ((.target_path // "") + "/" + (.file_name // ""))       # <-- no JIRA suffix
+                  }
+                | select(.comp != "" and .file_name != "" and .iid != "" and .src_path != "" and .target_path != "" and .dest_dir != "" and .dest_path != "")
+              ]
+            ' > linux_tasks_exec.json
+        fi
+
+        echo "📄 LINUX tasks (ready):"; jq . linux_tasks_exec.json
+        LNX_READY=$(jq 'length' linux_tasks_exec.json)
+        echo "✅ LINUX tasks ready for execution: ${LNX_READY}"
+        if [[ "$LNX_READY" -eq 0 ]]; then
+          echo "❌ No valid LINUX task(s). Check TASK_INDEX and JSON."; exit 1
+        fi
+
+        # 4) Assume role (same as WAR)
+        echo "🔐 Assuming client account role..."
+      
+        CREDS=$(aws sts assume-role --role-arn "$ROLE_ARN" --role-session-name LinuxDeploySession --region "$REGION")
+        export AWS_ACCESS_KEY_ID=$(echo "$CREDS" | jq -r '.Credentials.AccessKeyId')
+        export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r '.Credentials.SecretAccessKey')
+        export AWS_SESSION_TOKEN=$(echo "$CREDS" | jq -r '.Credentials.SessionToken')
+        echo "✅ AssumeRole success"
+
+        # 5) SSM: mkdir target dir, copy file (NO delete), run deploy-linux.sh, wait + logs
+      
+        echo "🚀 Executing LINUX deployments via SSM (no delete in target dir)…"
+        SUCCESS_LIST=""
+        FAILURE_LIST=""
+
+        while IFS= read -r ROW; do
+          COMP=$(echo "$ROW" | jq -r '.comp')
+          APP_NAME=$(echo "$ROW" | jq -r '.file_name')
+          IID=$(echo "$ROW" | jq -r '.iid')
+          SRC_PATH=$(echo "$ROW" | jq -r '.src_path')
+          TARGET_DIR=$(echo "$ROW" | jq -r '.dest_dir')     # same as target_path
+          DEST_PATH=$(echo "$ROW" | jq -r '.dest_path')     # target_path/file
+          ROOT_DIR=$(echo "$ROW" | jq -r '.target_path')
+
+          SCRIPT_PATH="/tmp/${JIRA_ID}/scripts/deploy-linux.sh"
+
+          echo "----------------------------------------"
+          echo "🏷️  Component: $COMP"
+          echo "📦 Package:   $APP_NAME"
+          echo "🖥️  Instance: $IID"
+          echo "📄 Source:    $SRC_PATH"
+          echo "📁 TargetDir: $TARGET_DIR"
+          echo "📄 DestPath:  $DEST_PATH"
+          echo "📜 Script:    $SCRIPT_PATH"
+          echo "⏱️  Timeout:  ${LINUX_SSM_TIMEOUT_SECS}s"
+
+          # SAFETY GUARD: refuse root/empty target_path
+          SAFE_GUARD=$(printf 'case %q in ("/"|"") echo "Refusing to operate on empty/root target_path"; exit 99;; esac' "$ROOT_DIR")
+
+          # CMD0: basic sanity + script availability
+          CMD0=$(printf 'set -euo pipefail; echo "==[CMD0] Sanity & script check"; %s; if [ ! -x %q ]; then echo "❌ deploy-linux.sh not found/executable at %s"; exit 1; fi; echo "✅ Script present: %s"' \
+                      "$SAFE_GUARD" "$SCRIPT_PATH" "$SCRIPT_PATH" "$SCRIPT_PATH")
+
+          # CMD1: ensure parent directory of destination (handles file paths)
+          CMD1=$(printf 'set -euo pipefail; echo "==[CMD1] Ensuring target directory (parent of dest)"; PARENT_DIR=$(dirname %q); if [ -z "$PARENT_DIR" ]; then echo "Refusing to operate on empty parent dir"; exit 99; fi; sudo mkdir -p "$PARENT_DIR"; echo "✅ Ensured: $PARENT_DIR"' \
+            "$DEST_PATH")
+
+          # CMD2: list dirs (non-fatal if empty/missing)
+          CMD2=$(printf 'set -euo pipefail; echo "==[CMD2] Listing dirs before copy"; { echo "ROOT_DIR: %s"; ls -la %q; } || echo "⚠️ ROOT_DIR missing"; { echo "TARGET_DIR: %s"; ls -la %q; } || echo "⚠️ TARGET_DIR missing"; true' \
+                      "$ROOT_DIR" "$ROOT_DIR" "$TARGET_DIR" "$TARGET_DIR")
+
+          # CMD3: check source & copy (verbose). If copy fails → exit 1 (real error).
+          CMD3=$(printf 'set -euo pipefail; echo "==[CMD3] Source check & copy"; if [ ! -f %q ]; then echo "⚠️ Source missing: %s (will rely on deploy script to handle)"; else echo "✅ Source found: %s"; echo "→ cp -fv %q %q"; sudo cp -fv %q %q; echo "✅ Copy done"; fi' \
+                      "$SRC_PATH" "$SRC_PATH" "$SRC_PATH" "$SRC_PATH" "$DEST_PATH" "$SRC_PATH" "$DEST_PATH")
+
+          # CMD4: list after copy (non-fatal)
+          CMD4=$(printf 'set -euo pipefail; echo "==[CMD4] Listing after copy"; { ls -la %q; } || echo "⚠️ Dest file not present yet"; { ls -la %q; } || echo "⚠️ Target dir not present"; true' \
+                      "$DEST_PATH" "$ROOT_DIR")
+
+          # CMD5: run deploy script (authoritative). Pass full dest path; script preserves owner/perms.
+          CMD5=$(printf 'set -euo pipefail; echo "==[CMD5] Running deploy script"; echo "sudo bash %q %q %q %q"; sudo bash %q %q %q %q; rc=$?; echo "==[CMD5] deploy-linux.sh exit: $rc"; exit $rc' \
+                      "$SCRIPT_PATH" "$JIRA_ID" "$APP_NAME" "$DEST_PATH" \
+                      "$SCRIPT_PATH" "$JIRA_ID" "$APP_NAME" "$DEST_PATH")
+
+          # Build the SSM parameters JSON
+          jq -n \
+            --arg c0 "$CMD0" \
+            --arg c1 "$CMD1" \
+            --arg c2 "$CMD2" \
+            --arg c3 "$CMD3" \
+            --arg c4 "$CMD4" \
+            --arg c5 "$CMD5" \
+            --arg t  "$LINUX_SSM_TIMEOUT_SECS" \
+            '{commands: [$c0,$c1,$c2,$c3,$c4,$c5], executionTimeout: [$t] }' > commands_deploy.json
+
+          CMD_ID=$(aws ssm send-command \
+            --region "$REGION" \
+            --document-name "AWS-RunShellScript" \
+            --instance-ids "$IID" \
+            --comment "LINUX deploy: '"$APP_NAME"' ('"$COMP"')" \
+            --parameters file://commands_deploy.json \
+            --query "Command.CommandId" \
+            --output text)
+
+          if [[ -z "$CMD_ID" || "$CMD_ID" == "None" ]]; then
+            echo "❌ Failed to start SSM command for $APP_NAME on $IID"
+            FAILURE_LIST="${FAILURE_LIST}\n${COMP}:${APP_NAME} (send-command failed)"
+            continue
+          fi
+
+          echo "⏳ Waiting for SSM (CommandId=$CMD_ID)…"
+          if ! aws ssm wait command-executed --region "$REGION" --command-id "$CMD_ID" --instance-id "$IID"; then
+            echo "⚠️ SSM waiter failure/timeout — fetching logs anyway"
+          fi
+
+          STATUS=$(aws ssm list-command-invocations \
+            --region "$REGION" \
+            --command-id "$CMD_ID" \
+            --instance-id "$IID" \
+            --details \
+            --query "CommandInvocations[0].Status" \
+            --output text 2>/dev/null || echo "Unknown")
+
+          STDOUT=$(aws ssm get-command-invocation \
+            --region "$REGION" \
+            --command-id "$CMD_ID" \
+            --instance-id "$IID" \
+            --query "StandardOutputContent" \
+            --output text 2>/dev/null || echo "")
+          STDERR=$(aws ssm get-command-invocation \
+            --region "$REGION" \
+            --command-id "$CMD_ID" \
+            --instance-id "$IID" \
+            --query "StandardErrorContent" \
+            --output text 2>/dev/null || echo "")
+
+          echo "🪵 STDOUT:"; printf '%s\n' "$STDOUT"
+          echo "🪵 STDERR:"; printf '%s\n' "$STDERR"
+          echo "📄 Final Status: $STATUS"
+
+          if [[ "$STATUS" != "Success" ]]; then
+            echo "❌ Failure: ${COMP}:${APP_NAME} (status=$STATUS)"
+            FAILURE_LIST="${FAILURE_LIST}\n${COMP}:${APP_NAME} (status=$STATUS)"
+          elif echo "$STDERR" | grep -Eiq 'error|failed|exception|traceback'; then
+            echo "❌ Failure: ${COMP}:${APP_NAME} (stderr indicates error)"
+            FAILURE_LIST="${FAILURE_LIST}\n${COMP}:${APP_NAME} (stderr error)"
+          else
+            echo "✅ Success: ${COMP}:${APP_NAME}"
+            SUCCESS_LIST="${SUCCESS_LIST}\n${COMP}:${APP_NAME}"
+          fi
+
+        done < <(jq -c '.[]' linux_tasks_exec.json)
+
+        echo "========================================"
+        echo "🎯 LINUX Deployment Summary (JIRA=${JIRA_ID})"
+        printf '✅ Successful:\n%s\n' "${SUCCESS_LIST:-<none>}"
+        printf '❌ Failed:\n%s\n' "${FAILURE_LIST:-<none>}"
+        echo "========================================"
+
+        if [[ -n "${FAILURE_LIST// }" ]]; then
+          exit 1
+        fi
+
+  post_build:
+    commands:
+      - |
+        echo "Resetting AWS credentials to CodeBuild role..."
+
+        unset AWS_ACCESS_KEY_ID
+        unset AWS_SECRET_ACCESS_KEY
+        unset AWS_SESSION_TOKEN
+        
+        exec > >(stdbuf -oL tee -a /tmp/build.log) 2>&1
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [POST_BUILD] UPLOADING_LOGS"
+
+        # Use parent execution ID if passed, otherwise use own
+        EXEC_FOLDER="${PARENT_EXECUTION_ID:-$PIPELINE_EXECUTION_ID}"
+
+        S3_PATH="s3://nonprod-release-management-codebuild-logs/pipeline-logs/$EXEC_FOLDER/$STAGE_NAME/build.log"
+        aws s3 cp /tmp/build.log "$S3_PATH"
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [POST_BUILD] LOGS_UPLOADED_TO=$S3_PATH"
+
+artifacts:
+  files:
+    - '**/*'

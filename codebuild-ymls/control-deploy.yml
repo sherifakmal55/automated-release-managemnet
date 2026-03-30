@@ -1,0 +1,511 @@
+version: 0.2
+
+env:
+  variables:
+    # default SSM timeout for commands executed on instances
+    CONTROL_SSM_TIMEOUT_SECS: "1800"
+    DEFAULT_REGION: "eu-west-1"
+    ASSUME_ROLE_SESSION: "ControlDeploySession"
+  exported-variables: []
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.11
+    commands:
+      - echo "📦 Installing dependencies..."
+      - yum install -y jq awscli || echo "⚠️ yum install may require elevated privileges in CodeBuild image"
+      - echo "✅ Install complete"
+
+  build:
+    commands:
+      - |
+        exec > >(stdbuf -oL tee -a /tmp/build.log) 2>&1
+        echo STAGE_NAME=$STAGE_NAME
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [BUILD]📥 Reading task.json from SSM using JIRA_ID=$JIRA_ID"
+        TASK_PARAM_PATH="/rm-flow-controller/${JIRA_ID}/task.json"
+      
+        echo "🔎 SSM path: $TASK_PARAM_PATH"
+      
+        TASK_JSON="$(aws ssm get-parameter \
+          --name "$TASK_PARAM_PATH" \
+          --with-decryption \
+          --query 'Parameter.Value' \
+          --output text \
+          --region "$DEFAULT_REGION")" || true
+        if [[ -z "$TASK_JSON" || "$TASK_JSON" == "None" ]]; then
+          echo "❌ Empty SSM value for $TASK_PARAM_PATH"; exit 1
+        fi
+        printf '%s\n' "$TASK_JSON" > task.json
+        echo "✅ Saved to task.json"; jq . task.json || cat task.json
+
+        # 2) basics + Parameter Store (collect control metadata BEFORE assume-role)
+      
+        echo "📌 Extracting metadata..."
+        CLIENT=$(jq -r '.client // empty' task.json)
+        ENV=$(jq -r '.env // empty' task.json)
+        JIRA_ID=$(jq -r '.jira_ticket // empty' task.json || echo "$JIRA_ID")
+        echo "✅ Fields: CLIENT=${CLIENT:-<missing>} ENV=${ENV:-<missing>} JIRA=${JIRA_ID}"
+        if [[ -z "$CLIENT" || -z "$ENV" ]]; then
+          echo "❌ client/env missing in task.json"; exit 1
+        fi
+
+        PARAM_PATH="/arm-cpr/${CLIENT}/${ENV}/details.json"
+        echo "📥 Fetching Parameter Store metadata at $PARAM_PATH"
+        PARAM_JSON="$(aws ssm get-parameter --name "$PARAM_PATH" --with-decryption --query 'Parameter.Value' --output text --region "$DEFAULT_REGION")" || true
+        if [[ -z "$PARAM_JSON" || "$PARAM_JSON" == "None" ]]; then
+          echo "❌ Failed to fetch Parameter Store $PARAM_PATH"; exit 1
+        fi
+        printf '%s\n' "$PARAM_JSON" > /tmp/param_json.json
+        echo "$PARAM_JSON" | jq . >/dev/null
+        echo "✅ Parameter JSON fetched"
+
+        REGION=$(jq -r '.region // empty' /tmp/param_json.json)
+        ROLE_ARN=$(jq -r '.assume_role_arn // empty' /tmp/param_json.json)
+        SECRET_ARN=$(jq -r '.database_details.secret_arn // empty' /tmp/param_json.json)
+        ORACLE_PATH=$(jq -r '.database_details.oracle_path // empty' /tmp/param_json.json)
+
+        # Assume role to access Secrets Manager
+        ASSUME_ROLE_OUTPUT=$(aws sts assume-role \
+          --role-arn "$ROLE_ARN" \
+          --role-session-name "CodeBuildSession" \
+          --region "$REGION")
+
+        export AWS_ACCESS_KEY_ID=$(echo "$ASSUME_ROLE_OUTPUT" | jq -r '.Credentials.AccessKeyId')
+        export AWS_SECRET_ACCESS_KEY=$(echo "$ASSUME_ROLE_OUTPUT" | jq -r '.Credentials.SecretAccessKey')
+        export AWS_SESSION_TOKEN=$(echo "$ASSUME_ROLE_OUTPUT" | jq -r '.Credentials.SessionToken')
+
+        # Fetch secret from Secrets Manager
+        SECRET_JSON=$(aws secretsmanager get-secret-value \
+          --secret-id "$SECRET_ARN" \
+          --region "$REGION" \
+          --query "SecretString" \
+          --output text)
+
+        # Extract Oracle password
+        ORACLE_PASS=$(echo "$SECRET_JSON" | jq -r '.password')
+        echo "✅ Password exported and stored as a ORACLE_PASS variable"
+
+        echo $ORACLE_PASS
+
+        # Unset temporary credentials
+        unset AWS_ACCESS_KEY_ID
+        unset AWS_SECRET_ACCESS_KEY
+        unset AWS_SESSION_TOKEN
+
+        # control_details
+        WC_USER=$(jq -r '.control_details.wc_user // empty' /tmp/param_json.json)
+        WC_PASS=$(jq -r '.control_details.wc_password // empty' /tmp/param_json.json)
+        CONTROL_IP_CONF=$(jq -r '.control_details.control_server_ip // empty' /tmp/param_json.json)
+        CONTROL_PORT_CONF=$(jq -r '.control_details.control_server_port // empty' /tmp/param_json.json)
+        JAVA_PATH=$(jq -r '.wildfly_details.java_path // empty' /tmp/param_json.json)
+
+        # SQL instance used to run backup-get-project-id.sh (used for granular import)
+        SQL_INSTANCE_ID=$(jq -r '.task_type_mappings.sqlserver_instance_id // empty' /tmp/param_json.json)
+
+        # normalize values
+        [[ "$REGION" == "null" ]] && REGION=""
+        [[ "$ROLE_ARN" == "null" ]] && ROLE_ARN=""
+
+        if [[ -z "$REGION" || -z "$ROLE_ARN" ]]; then
+          echo "❌ region/assume_role_arn missing in Parameter Store"; exit 1
+        fi
+
+        # warn if control details missing
+        if [[ -z "$WC_USER" || -z "$WC_PASS" || -z "$CONTROL_IP_CONF" || -z "$CONTROL_PORT_CONF" ]]; then
+          echo "⚠️ One or more control_details keys missing in Parameter Store. CONTROL deploys may fail."
+        else
+          echo "✅ control_details present"
+        fi
+
+        # 3) Select single CONTROL deploy item based on TASK_INDEX (must be provided)
+      
+        echo "🎯 Selecting single CONTROL deploy item (TASK_INDEX=${TASK_INDEX:-<unset>})..."
+        if [[ -z "${TASK_INDEX:-}" ]]; then
+          echo "❌ TASK_INDEX not provided. This build processes a single control item by TASK_INDEX (zero-based)."; exit 1
+        fi
+
+        if ! echo "$TASK_INDEX" | grep -Eq '^[0-9]+$'; then
+          echo "❌ TASK_INDEX must be numeric: ${TASK_INDEX}"; exit 1
+        fi
+
+        DEPLOY_COUNT=$(jq '.deploy | length' task.json 2>/dev/null || echo 0)
+        if [ "$TASK_INDEX" -ge "$DEPLOY_COUNT" ]; then
+          echo "❌ TASK_INDEX ${TASK_INDEX} out of range (deploy count=${DEPLOY_COUNT})"; exit 1
+        fi
+
+        DEPLOY_ITEM="$(jq -c ".deploy[$TASK_INDEX]" task.json 2>/dev/null || echo "")"
+        if [[ -z "$DEPLOY_ITEM" || "$DEPLOY_ITEM" == "null" ]]; then
+          echo "❌ No deploy[$TASK_INDEX] found in task.json"; exit 1
+        fi
+
+        TASK_TYPE_ACTUAL=$(jq -r '.task_type // empty' <<< "$DEPLOY_ITEM")
+        if ! echo "$TASK_TYPE_ACTUAL" | grep -Ei '^Control' >/dev/null; then
+          echo "❌ deploy[$TASK_INDEX].task_type='$TASK_TYPE_ACTUAL' is not a Control-type; aborting"; exit 1
+        fi
+
+        # extract fields from the selected deploy item
+        SERVER_NAME=$(jq -r '.server_name // .server // empty' <<< "$DEPLOY_ITEM")
+        FILE_NAME=$(jq -r '.file_name // .control_file // empty' <<< "$DEPLOY_ITEM")
+        TARGET_PATH_ITEM=$(jq -r '.target_path // empty' <<< "$DEPLOY_ITEM")
+        PROJECT_NAME_TMP=$(jq -r '.project_name // .project_to_deploy // empty' <<< "$DEPLOY_ITEM")
+
+        if [[ -z "$SERVER_NAME" || -z "$FILE_NAME" ]]; then
+          echo "❌ Selected control item missing server or file_name"; exit 1
+        fi
+
+        # derive instance id and src_path from parameter json and JIRA
+        SKEY=$(printf '%s' "$SERVER_NAME" | tr '[:upper:]' '[:lower:]')
+        IID=$(jq -r --arg s "$SKEY" '.Instance_mappings[($s + "_instance_id")] // empty' /tmp/param_json.json)
+        SRC_PATH_REMOTE="/tmp/${JIRA_ID}/client-packages/${JIRA_ID}/deploy/${FILE_NAME}"
+        SCRIPT_DIR="/tmp/${JIRA_ID}/scripts"
+        PROJECT_NAME="${PROJECT_NAME_TMP}"
+
+        # emit a single-item array file to keep downstream logic identical
+        jq -n --arg server_name "$SERVER_NAME" --arg file_name "$FILE_NAME" --arg target_path "$TARGET_PATH_ITEM" --arg iid "$IID" --arg src_path "$SRC_PATH_REMOTE" --arg script_dir "$SCRIPT_DIR" --arg project_name "$PROJECT_NAME" '[{server_name:$server_name,file_name:$file_name,target_path:$target_path,iid:$iid,src_path:$src_path,script_dir:$script_dir,project_name:$project_name}]' > control_deploy_tasks.json || true
+
+        echo "📄 CONTROL deploy tasks (selected item):"
+        jq . control_deploy_tasks.json || cat control_deploy_tasks.json
+        CONTROL_READY=$(jq 'length' control_deploy_tasks.json 2>/dev/null || echo 0)
+        echo "✅ CONTROL deploy tasks ready for execution: ${CONTROL_READY}"
+        if [[ "$CONTROL_READY" -eq 0 ]]; then
+          echo "❌ No valid CONTROL deploy task(s). Nothing to do."; exit 1
+        fi
+
+        # 4) Assume role into client account
+        echo "🔐 Assuming client account role..."
+      
+        CREDS=$(aws sts assume-role --role-arn "$ROLE_ARN" --role-session-name "$ASSUME_ROLE_SESSION" --region "$REGION")
+        if [[ -z "$CREDS" || "$CREDS" == "None" ]]; then
+          echo "❌ assume-role failed"; exit 1
+        fi
+        export AWS_ACCESS_KEY_ID=$(echo "$CREDS" | jq -r '.Credentials.AccessKeyId')
+        export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r '.Credentials.SecretAccessKey')
+        export AWS_SESSION_TOKEN=$(echo "$CREDS" | jq -r '.Credentials.SessionToken')
+        echo "✅ AssumeRole success (region=$REGION)"
+
+        # 5) Process the single control task (same SSM sequence as before)
+      
+        echo "🚀 Executing selected CONTROL deploy via SSM (artifacts expected on control server)..."
+        SUCCESS_LIST=""
+        FAILURE_LIST=""
+
+        # helper to mask password in outputs (same as backup)
+        mask() {
+          local s="$1"
+          if [[ -n "${WC_PASS:-}" ]]; then
+            printf '%s' "$s" | sed "s|${WC_PASS}|****|g"
+          else
+            printf '%s' "$s"
+          fi
+        }
+
+        ROW=$(jq -c '.[0]' control_deploy_tasks.json)
+        SERVER_NAME=$(jq -r '.server_name' <<< "$ROW")
+        FILE_NAME=$(jq -r '.file_name' <<< "$ROW")
+        IID=$(jq -r '.iid' <<< "$ROW")
+        SRC_PATH_REMOTE=$(jq -r '.src_path' <<< "$ROW")
+        SCRIPT_DIR=$(jq -r '.script_dir' <<< "$ROW")
+        PROJECT_NAME=$(jq -r '.project_name // empty' <<< "$ROW")
+
+        echo "----------------------------------------"
+        echo "🏷️  Server: $SERVER_NAME"
+        echo "📄 Control file: $FILE_NAME"
+        echo "🖥️  Control instance: $IID"
+        echo "📦 Expected remote source path on control server: $SRC_PATH_REMOTE"
+        echo "📜 Remote script dir: $SCRIPT_DIR"
+
+        # validate instance mapping
+        if [[ -z "$IID" || "$IID" == "null" ]]; then
+          echo "❌ No instance mapping for control server '$SERVER_NAME'"; exit 1
+        fi
+
+        # detect extension (.tcg granular import, .tcm modular import)
+        EXT="${FILE_NAME##*.}"
+        echo "🔖 Detected ext: .$EXT"
+
+        # If granular import (.tcg) we need to fetch PROJECT_ID by running backup-get-project-id.sh on SQL_INSTANCE_ID
+        PROJECT_ID=""
+        if [[ "${EXT,,}" == "tcg" ]]; then
+          if [[ -z "$PROJECT_NAME" || "$PROJECT_NAME" == "null" ]]; then
+            echo "❌ Missing project_name in task.json for granular import"; exit 1
+          fi
+          if [[ -z "$SQL_INSTANCE_ID" || "$SQL_INSTANCE_ID" == "null" ]]; then
+            echo "❌ SQL instance id not configured in Parameter Store (cannot run get-project-id)"; exit 1
+          fi
+
+          echo "🧾 Running backup-get-project-id.sh on SQL instance $SQL_INSTANCE_ID for project '$PROJECT_NAME'"
+
+          CMDS_GET=$(jq -n --arg jira "$JIRA_ID" '{commands: ["set -euo pipefail", "cd /tmp/" + $jira + "/scripts || true"]}')
+          ORA_HOST=$(jq -r '.database_details.oracle_host // empty' /tmp/param_json.json)
+          ORA_PORT=$(jq -r '.database_details.oracle_port // empty' /tmp/param_json.json)
+          ORA_SID=$(jq -r '.database_details.oracle_sid // empty' /tmp/param_json.json)
+          ORA_USER=$(jq -r '.database_details.oracle_user // empty' /tmp/param_json.json)
+          
+
+          CMDS_GET=$(echo "$CMDS_GET" | jq --arg script "./backup-get-project-id.sh" --arg host "$ORA_HOST" --arg port "$ORA_PORT" --arg sid "$ORA_SID" --arg user "$ORA_USER" --arg pass "$ORACLE_PASS" --arg proj "'$PROJECT_NAME'" --arg oracle_path "$ORACLE_PATH" '.commands += [($script + " " + $host + " " + $port + " " + $sid + " " + $user + " " + $pass + " " + $proj + " " + $oracle_path)]')
+          echo "$CMDS_GET" > commands_get_project.json
+
+          GET_CMD_ID=$(aws ssm send-command \
+            --document-name "AWS-RunShellScript" \
+            --instance-ids "${SQL_INSTANCE_ID}" \
+            --comment "get-project-id for ${PROJECT_NAME}" \
+            --parameters file://commands_get_project.json \
+            --region "$REGION" \
+            --query 'Command.CommandId' --output text) || true
+
+          if [[ -z "$GET_CMD_ID" || "$GET_CMD_ID" == "None" ]]; then
+            echo "❌ Failed to send get-project-id command to ${SQL_INSTANCE_ID}"; exit 1
+          fi
+
+          echo "⏳ Waiting for get-project-id command (${GET_CMD_ID})..."
+          if ! aws ssm wait command-executed --region "$REGION" --command-id "$GET_CMD_ID" --instance-id "$SQL_INSTANCE_ID"; then
+            echo "⚠️ SSM waiter for get-project-id reported non-success (will still try to fetch output)"
+          fi
+
+          OUT_GET=$(aws ssm get-command-invocation --command-id "$GET_CMD_ID" --instance-id "$SQL_INSTANCE_ID" --region "$REGION" --output json 2>/dev/null || true)
+          GET_STDOUT=$(echo "$OUT_GET" | jq -r '.StandardOutputContent // ""')
+          GET_STDERR=$(echo "$OUT_GET" | jq -r '.StandardErrorContent // ""')
+          echo "📄 get-project-id Output:"
+          printf '%s\n' "$GET_STDOUT"
+          if [[ -n "$GET_STDERR" ]]; then
+            echo "🪵 get-project-id Stderr:"; printf '%s\n' "$GET_STDERR"
+          fi
+
+          PROJECT_ID=$(echo "$GET_STDOUT" | grep -Eo -i '([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|SYSTEM[[:alnum:]_-]*PROJECT[[:alnum:]_-]*)' | tail -n1 || true)
+
+          PROJECT_ID=${PROJECT_ID//$'\r'/}
+
+          if [[ -z "$PROJECT_ID" ]]; then
+            echo "❌ Could not extract PROJECT_ID from get-project-id output"; exit 1
+          fi
+          echo "✅ Obtained PROJECT_ID=$PROJECT_ID for project '$PROJECT_NAME'"
+        fi
+
+        # choose mode/script and pid placeholder
+        if [[ "${EXT,,}" == "tcm" ]]; then
+          MODE="deploy-modularimport.sh"
+          PID_VAL="null"
+        else
+          MODE="deploy-granularimport.sh"
+          PID_VAL="${PROJECT_ID}"
+        fi
+
+        # -------------------------------------------------------------------------
+        # Build commands_control_deploy.json template (choose template based on MODE)
+        # -------------------------------------------------------------------------
+        if [[ "${MODE}" == "deploy-modularimport.sh" ]]; then
+          cat > commands_control_deploy.json <<'JSON_TPL'
+        {
+          "commands": [
+            "set -euo pipefail",
+            "mkdir -p /tmp/__JIRA__/control_deploy",
+            "UTIL_SUB=$(ls -1 /tmp/__JIRA__/utilities/control 2>/dev/null | grep -E '^tool' | head -n1 | tr -d '\\r' | sed 's/[[:space:]]*$//' || true)",
+            "echo \"DEBUG: UTIL_SUB=[$UTIL_SUB] (len=$(echo -n $UTIL_SUB | wc -c))\"",
+            "if [[ -n \"$UTIL_SUB\" ]]; then UTIL_PATH=\"/tmp/__JIRA__/utilities/control/$UTIL_SUB\"; else UTIL_PATH=\"/tmp/__JIRA__/utilities/control\"; fi",
+            "echo \"DEBUG: UTIL_PATH=[$UTIL_PATH]\"",
+            "TARGET_FILE=/tmp/__JIRA__/control_deploy/__FILE__",
+            "SRC_FILE=/tmp/__JIRA__/client-packages/__JIRA__/deploy/__FILE__",
+            "echo \"Using UTIL_PATH=$UTIL_PATH SRC_FILE=$SRC_FILE TARGET_FILE=$TARGET_FILE\"",
+            "if [[ -f \"$SRC_FILE\" ]]; then cp -f \"$SRC_FILE\" \"$TARGET_FILE\"; else echo \"❌ Artifact not found on control server at $SRC_FILE\"; exit 3; fi",
+            "/tmp/__JIRA__/scripts/__MODE__ \"$UTIL_PATH\" \"$TARGET_FILE\" \"__WCUSER__\" __WCPASS__ \"__CTRLIP__\" \"__CTRLP__\" \"__JAVA_PATH__\"",
+            "if [[ -f \"$TARGET_FILE\" ]]; then echo \"✅ Control deploy file exists: $TARGET_FILE\"; else echo \"⚠️ Control deploy file not found: $TARGET_FILE\"; exit 3; fi"
+          ]
+        }
+        JSON_TPL
+                else
+                  cat > commands_control_deploy.json <<'JSON_TPL'
+        {
+          "commands": [
+            "set -euo pipefail",
+            "mkdir -p /tmp/__JIRA__/control_deploy",
+            "UTIL_SUB=$(ls -1 /tmp/__JIRA__/utilities/control 2>/dev/null | grep -E '^tool' | head -n1 | tr -d '\\r' | sed 's/[[:space:]]*$//' || true)",
+            "echo \"DEBUG: UTIL_SUB=[$UTIL_SUB] (len=$(echo -n $UTIL_SUB | wc -c))\"",
+            "if [[ -n \"$UTIL_SUB\" ]]; then UTIL_PATH=\"/tmp/__JIRA__/utilities/control/$UTIL_SUB\"; else UTIL_PATH=\"/tmp/__JIRA__/utilities/control\"; fi",
+            "echo \"DEBUG: UTIL_PATH=[$UTIL_PATH]\"",
+            "TARGET_FILE=/tmp/__JIRA__/control_deploy/__FILE__",
+            "SRC_FILE=/tmp/__JIRA__/client-packages/__JIRA__/deploy/__FILE__",
+            "echo \"Using UTIL_PATH=$UTIL_PATH SRC_FILE=$SRC_FILE TARGET_FILE=$TARGET_FILE\"",
+            "if [[ -f \"$SRC_FILE\" ]]; then cp -f \"$SRC_FILE\" \"$TARGET_FILE\"; else echo \"❌ Artifact not found on control server at $SRC_FILE\"; exit 3; fi",
+            "/tmp/__JIRA__/scripts/__MODE__ \"$UTIL_PATH\" \"__PID__\" \"$TARGET_FILE\" \"__WCUSER__\" __WCPASS__ \"__CTRLIP__\" \"__CTRLP__\" \"__JAVA_PATH__\"",
+            "if [[ -f \"$TARGET_FILE\" ]]; then echo \"✅ Control deploy file exists: $TARGET_FILE\"; else echo \"⚠️ Control deploy file not found: $TARGET_FILE\"; exit 3; fi"
+          ]
+        }
+        JSON_TPL
+                fi
+
+        # placeholder replacement (raw, no masking)
+        sed -e "s|__JIRA__|${JIRA_ID}|g" \
+            -e "s|__FILE__|${FILE_NAME}|g" \
+            -e "s|__WCUSER__|${WC_USER}|g" \
+            -e "s|__WCPASS__|${WC_PASS}|g" \
+            -e "s|__CTRLIP__|${CONTROL_IP_CONF}|g" \
+            -e "s|__CTRLP__|${CONTROL_PORT_CONF}|g" \
+            -e "s|__PID__|${PID_VAL}|g" \
+            -e "s|__JAVA_PATH__|${JAVA_PATH}|g" \
+            -e "s|__MODE__|${MODE}|g" \
+            commands_control_deploy.json > commands_control_deploy.json.tmp && mv commands_control_deploy.json.tmp commands_control_deploy.json
+
+        echo
+        echo "🔍 Debug (RAW variables):"
+        echo "  JIRA_ID: ${JIRA_ID}"
+        echo "  FILE_NAME: ${FILE_NAME}"
+        echo "  IID: ${IID}"
+        echo "  MODE: ${MODE}"
+        echo "  PID_VAL: ${PID_VAL}"
+        echo "  WC_USER: ${WC_USER}"
+        echo "  WC_PASS: ${WC_PASS}"
+        echo "  JAVA_PATH: ${JAVA_PATH}"
+        echo "  CONTROL_IP: ${CONTROL_IP_CONF}"
+        echo "  CONTROL_PORT: ${CONTROL_PORT_CONF}"
+        echo
+
+        echo "🔎 Validate generated commands_control_deploy.json is valid JSON"
+        if ! jq -e . commands_control_deploy.json >/dev/null 2>&1; then
+          echo "❌ commands_control_deploy.json invalid JSON (preview):"
+          cat commands_control_deploy.json || true
+          exit 1
+        else
+          echo "✅ commands_control_deploy.json is valid JSON"
+        fi
+
+        echo "📋 Preview commands_control_deploy.json content (RAW):"
+        echo "####### cmd sending ###################"
+        cat commands_control_deploy.json
+        echo
+
+        # Send SSM command to control instance
+        echo "📨 Sending SSM command to control instance ${IID}..."
+        CTRL_CMD_ID=$(aws ssm send-command \
+          --document-name "AWS-RunShellScript" \
+          --instance-ids "${IID}" \
+          --comment "control-deploy for ${FILE_NAME}" \
+          --parameters file://commands_control_deploy.json \
+          --region "$REGION" \
+          --query 'Command.CommandId' --output text) || true
+
+        if [[ -z "$CTRL_CMD_ID" || "$CTRL_CMD_ID" == "None" ]]; then
+          echo "❌ Failed to send control-deploy command to ${IID}"; exit 1
+        fi
+
+        # --- Robust polling loop to wait for SSM command to finish ---
+        echo "⏳ Waiting for control-deploy SSM command (${CTRL_CMD_ID}) (polling)..."
+
+        : "${CONTROL_SSM_TIMEOUT_SECS:=1800}"
+        TIMEOUT_SECS=${CONTROL_SSM_TIMEOUT_SECS}
+        INTERVAL=5
+        START_TS=$(date +%s)
+        END_TS=$((START_TS + TIMEOUT_SECS))
+
+        _fetch_invocation() {
+          aws ssm get-command-invocation \
+            --command-id "${CTRL_CMD_ID}" \
+            --instance-id "${IID}" \
+            --region "${REGION}" \
+            --output json 2>/dev/null || true
+        }
+
+        LAST_STATUS=""
+        RAW_OUT_CTRL=""
+        while true; do
+          NOW=$(date +%s)
+          if (( NOW > END_TS )); then
+            echo "❌ Timeout reached waiting for command ${CTRL_CMD_ID} (waited ${TIMEOUT_SECS}s)"
+            RAW_OUT_CTRL=$(_fetch_invocation)
+            CTRL_STATUS=$(printf '%s' "$RAW_OUT_CTRL" | jq -r '.Status // empty')
+            CTRL_STDOUT=$(printf '%s' "$RAW_OUT_CTRL" | jq -r '.StandardOutputContent // ""')
+            CTRL_STDERR=$(printf '%s' "$RAW_OUT_CTRL" | jq -r '.StandardErrorContent // ""')
+            echo "Last known status: ${CTRL_STATUS}"
+            break
+          fi
+
+          RAW_OUT_CTRL=$(_fetch_invocation)
+
+          if [[ -z "$RAW_OUT_CTRL" || "$RAW_OUT_CTRL" == "null" ]]; then
+            echo "waiting for invocation to be available..."
+            sleep $INTERVAL
+            continue
+          fi
+
+          CTRL_STATUS=$(printf '%s' "$RAW_OUT_CTRL" | jq -r '.Status // empty')
+          CTRL_STDOUT=$(printf '%s' "$RAW_OUT_CTRL" | jq -r '.StandardOutputContent // ""')
+          CTRL_STDERR=$(printf '%s' "$RAW_OUT_CTRL" | jq -r '.StandardErrorContent // ""')
+
+          if [[ "$CTRL_STATUS" != "$LAST_STATUS" ]]; then
+            echo "📄 control-deploy Status: ${CTRL_STATUS} (at $(date -u +%T))"
+            LAST_STATUS="$CTRL_STATUS"
+          else
+            printf "."
+          fi
+
+          if [[ -n "$CTRL_STDOUT" ]]; then
+            echo
+            echo "---- StandardOutput (so far) ----"
+            printf '%s\n' "$CTRL_STDOUT"
+          fi
+          if [[ -n "$CTRL_STDERR" ]]; then
+            echo
+            echo "---- StandardError (so far) ----"
+            printf '%s\n' "$CTRL_STDERR"
+          fi
+
+          case "$CTRL_STATUS" in
+            Success|Failed|Cancelled|TimedOut|DeliveryTimedOut)
+              echo
+              echo "⏱️ Command reached terminal state: ${CTRL_STATUS}"
+              break
+              ;;
+            InProgress|Pending|Delayed|Cancelling)
+              sleep $INTERVAL
+              continue
+              ;;
+            *)
+              sleep $INTERVAL
+              continue
+              ;;
+          esac
+        done
+
+        # ensure we have final values
+        if [[ -z "${CTRL_STATUS:-}" || "${CTRL_STATUS}" == "null" ]]; then
+          RAW_OUT_CTRL=$(_fetch_invocation)
+          CTRL_STATUS=$(printf '%s' "$RAW_OUT_CTRL" | jq -r '.Status // empty')
+          CTRL_STDOUT=$(printf '%s' "$RAW_OUT_CTRL" | jq -r '.StandardOutputContent // ""')
+          CTRL_STDERR=$(printf '%s' "$RAW_OUT_CTRL" | jq -r '.StandardErrorContent // ""')
+        fi
+
+        echo "Final control-deploy Status: ${CTRL_STATUS}"
+        printf '%s\n' "$CTRL_STDOUT"
+        if [[ -n "$CTRL_STDERR" ]]; then
+          echo "🪵 control-deploy Stderr:"; printf '%s\n' "$CTRL_STDERR"
+        fi
+
+        # Determine success: require SSM Status == Success and no obvious error strings in stdout/stderr
+        if [[ "$CTRL_STATUS" == "Success" ]] && ! (printf '%s\n' "$CTRL_STDERR" | grep -Eiq 'error|failed|exception|traceback'); then
+          echo "✅ CONTROL deploy succeeded for ${SERVER_NAME}:${FILE_NAME}"
+        else
+          echo "❌ CONTROL deploy FAILED for ${SERVER_NAME}:${FILE_NAME} (status=${CTRL_STATUS})"; exit 1
+        fi
+
+  post_build:
+    commands:
+      - |
+        echo "Resetting AWS credentials to CodeBuild role..."
+
+        unset AWS_ACCESS_KEY_ID
+        unset AWS_SECRET_ACCESS_KEY
+        unset AWS_SESSION_TOKEN
+        
+        exec > >(stdbuf -oL tee -a /tmp/build.log) 2>&1
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [POST_BUILD] UPLOADING_LOGS"
+
+        # Use parent execution ID if passed, otherwise use own
+        EXEC_FOLDER="${PARENT_EXECUTION_ID:-$PIPELINE_EXECUTION_ID}"
+
+        S3_PATH="s3://nonprod-release-management-codebuild-logs/pipeline-logs/$EXEC_FOLDER/$STAGE_NAME/build.log"
+        aws s3 cp /tmp/build.log "$S3_PATH"
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [POST_BUILD] LOGS_UPLOADED_TO=$S3_PATH"
+
+artifacts:
+  files:
+    - '**/*'

@@ -1,0 +1,1363 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.11
+    commands:
+      - yum install -y coreutils || true
+      # ==============================
+      # GLOBAL LOGGING SETUP (ADDED)
+      # ==============================
+      - |
+        exec > >(stdbuf -oL tee -a /tmp/build.log) 2>&1
+        
+
+        
+
+
+        echo "=========================================="
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [BUILD]  PIPELINE_EXECUTION_ID=$PIPELINE_EXECUTION_ID"
+        echo PIPELINE_EXECUTION_ID=$PIPELINE_EXECUTION_ID
+        echo STAGE_NAME=$STAGE_NAME
+        echo "=========================================="
+
+      # ==============================
+      # ORIGINAL LOGIC (UNCHANGED)
+      # ==============================
+      - echo "📦 Installing dependencies..."
+      - yum install -y jq unzip awscli
+      - echo "✅ Install complete"
+
+  build:
+    commands:
+      - |
+        exec > >(stdbuf -oL tee -a /tmp/build.log) 2>&1
+        echo "📥 Reading task.json...."
+        cp $CODEBUILD_SRC_DIR_ValidatedOutput/task.json task.json
+        cat task.json
+
+        echo "📌 Extracting base fields..."
+        CLIENT=$(jq -r '.client' task.json)
+        ENV=$(jq -r '.env' task.json)
+        JIRA_ID=$(jq -r '.jira_ticket' task.json)
+        VERSION=$(jq -r '.version' task.json)
+      
+        echo "✅ Fields loaded: CLIENT=$CLIENT ENV=$ENV JIRA=$JIRA_ID VERSION=$VERSION"
+
+        echo "📥 Fetching Parameter Store JSON..."
+        PARAM_PATH="/arm-cpr/$CLIENT/$ENV/details.json"
+        PARAM_JSON=$(aws ssm get-parameter --name "$PARAM_PATH" --with-decryption --query 'Parameter.Value' --output text)
+        echo "$PARAM_JSON" | jq .
+
+        ROLE_ARN=$(echo "$PARAM_JSON" | jq -r '.assume_role_arn')
+        REGION=$(echo "$PARAM_JSON" | jq -r '.region')
+        SQL_INSTANCE_ID=$(echo "$PARAM_JSON" | jq -r '.task_type_mappings.sqlserver_instance_id')
+        JBOSS_PATH=$(echo "$PARAM_JSON" | jq -r '.wildfly_details.jboss_path')
+        KEYSTORE_PASS=$(echo "$PARAM_JSON" | jq -r '.control_details.key_pass')
+        AUTHTOKEN_PASS=$(echo "$PARAM_JSON" | jq -r '.control_details.auth_pass')
+      
+        if [[ -z "$ROLE_ARN" || "$ROLE_ARN" == "null" || -z "$REGION" || "$REGION" == "null" ]]; then
+          echo "❌ Missing role/region in Parameter Store"; exit 1
+        fi
+        echo "✅ Parameter JSON validated"
+
+        echo "🔐 Assuming client account role for SSM access..."
+        CREDS=$(aws sts assume-role --role-arn "$ROLE_ARN" --role-session-name Stage3CopySession)
+        export AWS_ACCESS_KEY_ID=$(echo "$CREDS" | jq -r '.Credentials.AccessKeyId')
+        export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r '.Credentials.SecretAccessKey')
+        export AWS_SESSION_TOKEN=$(echo "$CREDS" | jq -r '.Credentials.SessionToken')
+        echo "✅ AssumeRole success"
+
+        # initialize summary arrays
+      
+        set -euo pipefail
+        SUCCESS_LIST=()
+        FAIL_LIST=()
+
+        # =========================
+        # 0) DISCOVER TARGET NODES (WAR / LINUX / CONTROL / SQL / SYNTAX-CT)
+        # =========================
+        echo "🧭 Discovering target instances..."
+        DB_SQL_PRESENT=$(jq '[.backup[], .deploy[] | select(.task_type | test("^Database"; "i"))] | length' task.json 2>/dev/null || echo 0)
+      
+        set -euo pipefail
+        : > war_map.txt
+        : > linux_map.txt
+        : > control_map.txt
+        : > syntaxct_map.txt
+        : > ct_map.txt
+        : > tlm_view_map.txt
+        : > static_map.txt
+        INSTANCES=""
+
+        # Add SQL instance if DatabaseSql tasks exist
+        if [[ "$DB_SQL_PRESENT" -ge 1 && -n "${SQL_INSTANCE_ID:-}" && "$SQL_INSTANCE_ID" != "null" ]]; then
+          INSTANCES="$INSTANCES $SQL_INSTANCE_ID"
+        fi
+
+        # WAR: collect components and map to instance ids
+        WAR_COMPONENTS=$(jq -r '
+          .backup[]
+          | select(.task_type | test("^WarDeployment"))
+          | (.server_name // .server)
+          | select(.!=null)
+          | ascii_downcase
+        ' task.json | sort -u)
+
+        for COMP in $WAR_COMPONENTS; do
+          MAP_KEY="${COMP}_instance_id"
+          IID=$(echo "$PARAM_JSON" | jq -r --arg k "$MAP_KEY" '.Instance_mappings[$k]')
+          if [[ -n "${IID:-}" && "$IID" != "null" ]]; then
+            echo "$COMP $IID" >> war_map.txt
+            INSTANCES="$INSTANCES $IID"
+            echo "✅ Mapped WAR component '$COMP' → $IID"
+          else
+            echo "⚠️ Missing mapping for WAR component '$COMP' (.Instance_mappings.${MAP_KEY})"
+          fi
+        done
+
+        # LINUX: collect Linux components and map to instance ids
+
+        # DEBUG: Check what's being found
+        echo "DEBUG - Raw Linux task data:"
+        jq -r '
+          .backup[]
+          | select(.task_type | test("^LinuxPackages"))
+          | {task_type, server}
+        ' task.json
+
+        LINUX_COMPONENTS=$(jq -r '
+          .backup[]
+          | select(.task_type | test("^LinuxPackages"))
+          | (.server_name // .server)
+          | select(.!=null)
+          | ascii_downcase
+        ' task.json | sort -u)
+
+        # DEBUG: Check what's being found
+        echo "DEBUG - Found LINUX_COMPONENTS: $LINUX_COMPONENTS"
+
+        for COMP in $LINUX_COMPONENTS; do
+          MAP_KEY="${COMP}_instance_id"
+          IID=$(echo "$PARAM_JSON" | jq -r --arg k "$MAP_KEY" '.Instance_mappings[$k]')
+          if [[ -n "${IID:-}" && "$IID" != "null" ]]; then
+            echo "$COMP $IID" >> linux_map.txt
+            INSTANCES="$INSTANCES $IID"
+            echo "✅ Mapped LINUX component '$COMP' → $IID"
+          else
+            echo "⚠️ Missing mapping for LINUX component '$COMP' (.Instance_mappings.${MAP_KEY})"
+          fi
+        done
+
+        # CONTROL: collect Control components and map to instance ids
+        CONTROL_COMPONENTS=$(jq -r '
+          .backup[]
+          | select(.task_type | test("^Control"))
+          | (.server_name // .server)
+          | select(.!=null)
+          | ascii_downcase
+        ' task.json | sort -u)
+
+        for COMP in $CONTROL_COMPONENTS; do
+          MAP_KEY="${COMP}_instance_id"
+          IID=$(echo "$PARAM_JSON" | jq -r --arg k "$MAP_KEY" '.Instance_mappings[$k]')
+          if [[ -n "${IID:-}" && "$IID" != "null" ]]; then
+            echo "$COMP $IID" >> control_map.txt
+            INSTANCES="$INSTANCES $IID"
+            echo "✅ Mapped CONTROL component '$COMP' → $IID"
+          else
+            echo "⚠️ Missing mapping for CONTROL component '$COMP' (.Instance_mappings.${MAP_KEY})"
+          fi
+        done
+
+        # SYNTAX-CT: collect Syntax-CT components and map to instance ids
+        SYNTAXCT_COMPONENTS=$(jq -r '
+          .backup[]
+          | select(.task_type | test("^Syntax-CT"))
+          | (.server_name // .server)
+          | select(.!=null)
+          | ascii_downcase
+        ' task.json | sort -u)
+
+        for COMP in $SYNTAXCT_COMPONENTS; do
+          MAP_KEY="${COMP}_instance_id"
+          IID=$(echo "$PARAM_JSON" | jq -r --arg k "$MAP_KEY" '.Instance_mappings[$k]')
+          if [[ -n "${IID:-}" && "$IID" != "null" ]]; then
+            echo "$COMP $IID" >> syntaxct_map.txt
+            INSTANCES="$INSTANCES $IID"
+            echo "✅ Mapped SYNTAX-CT component '$COMP' → $IID"
+          else
+            echo "⚠️ Missing mapping for SYNTAX-CT component '$COMP' (.Instance_mappings.${MAP_KEY})"
+          fi
+        done
+
+        # CT: collect CT components and map to instance ids
+        CT_COMPONENTS=$(jq -r '
+          .backup[]
+          | select(.task_type | test("^ConfigurationTransfer"))
+          | (.server_name // .server)
+          | select(.!=null)
+          | ascii_downcase
+        ' task.json | sort -u)
+
+        for COMP in $CT_COMPONENTS; do
+          MAP_KEY="${COMP}_instance_id"
+          IID=$(echo "$PARAM_JSON" | jq -r --arg k "$MAP_KEY" '.Instance_mappings[$k]')
+          if [[ -n "${IID:-}" && "$IID" != "null" ]]; then
+            echo "$COMP $IID" >> ct_map.txt
+            INSTANCES="$INSTANCES $IID"
+            echo "✅ Mapped CT component '$COMP' → $IID"
+          else
+            echo "⚠️ Missing mapping for CT component '$COMP' (.Instance_mappings.${MAP_KEY})"
+          fi
+        done
+
+        TLM_VIEW_COMPONENTS=$(jq -r '
+          .backup[]
+          | select(.task_type | test("^TLMView"))
+          | (.server_name // .server)
+          | select(.!=null)
+          | ascii_downcase
+        ' task.json | sort -u)
+
+        for COMP in $TLM_VIEW_COMPONENTS; do
+          MAP_KEY="${COMP}_instance_id"
+          IID=$(echo "$PARAM_JSON" | jq -r --arg k "$MAP_KEY" '.Instance_mappings[$k]')
+          if [[ -n "${IID:-}" && "$IID" != "null" ]]; then
+            echo "$COMP $IID" >> tlm_view_map.txt
+            INSTANCES="$INSTANCES $IID"
+            echo "✅ Mapped TLM_VIEW component '$COMP' → $IID"
+          else
+            echo "⚠️ Missing mapping for TLM_VIEW component '$COMP' (.Instance_mappings.${MAP_KEY})"
+          fi
+        done
+
+        STATIC_COMPONENTS=$(jq -r '
+          .deploy[]
+          | select(.task_type | test("^Static"))
+          | (.server_name // .server)
+          | select(.!=null)
+          | ascii_downcase
+        ' task.json | sort -u)
+
+        for COMP in $STATIC_COMPONENTS; do
+          MAP_KEY="${COMP}_instance_id"
+          IID=$(echo "$PARAM_JSON" | jq -r --arg k "$MAP_KEY" '.Instance_mappings[$k]')
+          if [[ -n "${IID:-}" && "$IID" != "null" ]]; then
+            echo "$COMP $IID" >> static_map.txt
+            INSTANCES="$INSTANCES $IID"
+            echo "✅ Mapped STATIC component '$COMP' → $IID"
+          else
+            echo "⚠️ Missing mapping for STATIC component '$COMP' (.Instance_mappings.${MAP_KEY})"
+          fi
+        done
+
+        UNIQUE_INSTANCES=$(printf "%s\n" $INSTANCES | awk 'NF' | sort -u | xargs)
+        echo "🎯 Unique instances: $UNIQUE_INSTANCES"
+        echo "✅ Discovery complete"
+
+        # ==================================================
+        # 1) COPY RELEASE PACKAGE TO ALL TARGET INSTANCES
+        # ==================================================
+        echo "📦 Copying ${JIRA_ID}.zip to ALL targets first..."
+        S3_RELEASE_PATH="s3://smartstream-environment-file-transfer-bucket/release-management/client-packages/${JIRA_ID}.zip"
+      
+        set -euo pipefail
+        for IID in $UNIQUE_INSTANCES; do
+          if [[ -z "${IID:-}" || "$IID" == "null" ]]; then
+            echo "⚠️ Skipping empty/invalid instance id"; continue
+          fi
+
+          COMMANDS_JSON=$(jq -n \
+            --arg jira "$JIRA_ID" \
+            --arg region "$REGION" \
+            --arg release "$S3_RELEASE_PATH" \
+            '{commands: [
+              "set -euo pipefail",
+              "mkdir -p /tmp/" + $jira + "/client-packages",
+              "/usr/local/bin/aws s3 cp \($release) /tmp/" + $jira + "/client-packages/" + $jira + ".zip --region " + $region,
+              "unzip -o /tmp/" + $jira + "/client-packages/" + $jira + ".zip -d /tmp/" + $jira + "/client-packages/"
+            ]}')
+          echo "$COMMANDS_JSON" > commands_release.json
+
+          CMD_ID=$(aws ssm send-command \
+            --document-name "AWS-RunShellScript" \
+            --instance-ids "$IID" \
+            --comment "Copy & unzip ${JIRA_ID}.zip" \
+            --parameters file://commands_release.json \
+            --region "$REGION" \
+            --query 'Command.CommandId' --output text)
+          echo "🆔 CommandId ($IID): $CMD_ID"
+          if [[ -z "$CMD_ID" || "$CMD_ID" = "None" ]]; then echo "❌ send-command returned empty CommandId for $IID"; FAIL_LIST+=("RELEASE:$IID"); continue; fi
+
+          if ! aws ssm wait command-executed --command-id "$CMD_ID" --instance-id "$IID" --region "$REGION"; then
+            aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$IID" --region "$REGION" --output json \
+              | jq '{Status,StatusDetails,Stdout:.StandardOutputContent,Stderr:.StandardErrorContent}'
+            echo "❌ Release copy failed for $IID"; FAIL_LIST+=("RELEASE:$IID"); continue
+          fi
+
+          RES=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$IID" --region "$REGION" --output json)
+          ST=$(echo "$RES" | jq -r '.Status')
+          SE=$(echo "$RES" | jq -r '.StandardErrorContent // ""')
+          echo "$RES" | jq '{Status,StatusDetails}'
+          if [[ "$ST" != "Success" && "$ST" != "InProgress" ]]; then echo "❌ Release SSM status for $IID: $ST"; FAIL_LIST+=("RELEASE:$IID"); continue; fi
+          if echo "$SE" | grep -qi 'AccessDenied\|Forbidden\|error'; then echo "❌ Release STDERR for $IID"; echo "$SE"; FAIL_LIST+=("RELEASE:$IID"); continue; fi
+
+          echo "✅ ${JIRA_ID}.zip copied & unzipped on $IID"
+          SUCCESS_LIST+=("RELEASE:$IID")
+        done
+        echo "✅ Release ZIP copy complete on all targets"
+
+        # ===================================
+        # 1.5 PRECHECK: ensure SQL & WAR & LINUX scripts exist in S3
+        # ===================================
+      
+        set -euo pipefail
+        S3_SCRIPT_BASE="s3://smartstream-environment-file-transfer-bucket/release-management/common-scripts"
+        if [[ "$DB_SQL_PRESENT" -ge 1 ]]; then
+          echo "🔍 Prechecking SQL scripts in $S3_SCRIPT_BASE"
+          for F in backup-sqltable.sh backup-sqlprocedure.sh backup-sqlview.sh backup-sqlfunction.sh deploy-sqltask.sh rollback-sqltable.sh; do
+            if ! aws s3 ls "${S3_SCRIPT_BASE}/${F}" > /dev/null 2>&1; then
+              echo "❌ Missing SQL script ${S3_SCRIPT_BASE}/${F}"; FAIL_LIST+=("PRECHECK:SQL:${F}"); exit 1
+            fi
+          done
+          echo "✅ All SQL scripts present in S3"
+        fi
+        if [[ -s war_map.txt ]]; then
+          echo "🔍 Prechecking WAR scripts in $S3_SCRIPT_BASE"
+          for F in backup-war.sh deploy-war.sh; do
+            if ! aws s3 ls "${S3_SCRIPT_BASE}/${F}" > /dev/null 2>&1; then
+              echo "❌ Missing WAR script ${S3_SCRIPT_BASE}/${F}"; FAIL_LIST+=("PRECHECK:WAR:${F}"); exit 1
+            fi
+          done
+          echo "✅ WAR scripts present in S3"
+        fi
+        if [[ -s linux_map.txt ]]; then
+          echo "🔍 Prechecking LINUX scripts in $S3_SCRIPT_BASE"
+          for F in backup-linux.sh deploy-linux.sh; do
+            if ! aws s3 ls "${S3_SCRIPT_BASE}/${F}" > /dev/null 2>&1; then
+              echo "❌ Missing LINUX script ${S3_SCRIPT_BASE}/${F}"; FAIL_LIST+=("PRECHECK:LINUX:${F}"); exit 1
+            fi
+          done
+          echo "✅ LINUX scripts present in S3"
+        fi
+        if [[ -s control_map.txt ]]; then
+          echo "🔍 Prechecking CONTROL helper scripts in $S3_SCRIPT_BASE"
+          for F in backup-get-project-id.sh backup-modularexport.sh; do
+            if ! aws s3 ls "${S3_SCRIPT_BASE}/${F}" > /dev/null 2>&1; then
+              echo "❌ Missing CONTROL helper script ${S3_SCRIPT_BASE}/${F}"; FAIL_LIST+=("PRECHECK:CONTROL:${F}"); exit 1
+            fi
+          done
+          echo "✅ CONTROL helper scripts present in S3"
+        fi
+        if [[ -s ct_map.txt ]]; then
+          echo "🔍 Prechecking CT scripts in $S3_SCRIPT_BASE"
+          for F in backup-ct.sh deploy-ct.sh; do
+            if ! aws s3 ls "${S3_SCRIPT_BASE}/${F}" > /dev/null 2>&1; then
+              echo "❌ Missing CT script ${S3_SCRIPT_BASE}/${F}"; FAIL_LIST+=("PRECHECK:CT:${F}"); exit 1
+            fi
+          done
+          echo "✅ CT scripts present in S3"
+        fi
+
+        if [[ -s tlm_view_map.txt ]]; then
+          echo "🔍 Prechecking S3 for TLM_VIEW scripts..."
+          for SCRIPT in backup-tlmview.sh deploy-tlmview.sh; do
+            if ! aws s3 ls "${S3_SCRIPT_BASE}/${SCRIPT}" --region "$REGION" >/dev/null; then
+              echo "❌ Missing script ${SCRIPT} in $S3_SCRIPT_BASE"; FAIL_LIST+=("PRECHECK:TLM_VIEW:${SCRIPT}"); exit 1
+            fi
+          done
+          echo "✅ TLM View scripts present in S3"
+        fi
+
+        # ===================================
+        # 2) COMPONENT-WISE SCRIPT COPIES (SQL/WAR/LINUX) - unchanged logic but record success/fail
+        # ===================================
+        echo "🧩 Copying SQL scripts (if DatabaseSql present)..."
+      
+        set -euo pipefail
+        if [[ "$DB_SQL_PRESENT" -ge 1 ]]; then
+          if [[ -z "$SQL_INSTANCE_ID" || "$SQL_INSTANCE_ID" == "null" ]]; then echo "❌ Missing SQL instance id"; FAIL_LIST+=("SQL:SCRIPTS:MISSING_INSTANCE"); else
+            S3_SCRIPT_BASE="s3://smartstream-environment-file-transfer-bucket/release-management/common-scripts"
+            SCRIPT_FILES=("backup-sqltable.sh" "backup-sqlprocedure.sh" "backup-sqlview.sh" "backup-sqlfunction.sh" "deploy-sqltask.sh" "rollback-sqltable.sh")
+
+            CMDS=$(jq -n --arg jira "$JIRA_ID" '{commands: ["set -euo pipefail", "mkdir -p /tmp/" + $jira + "/scripts"]}')
+            for F in "${SCRIPT_FILES[@]}"; do
+              CMDS=$(echo "$CMDS" | jq --arg s3 "$S3_SCRIPT_BASE/$F" --arg jira "$JIRA_ID" --arg r "$REGION" \
+                '.commands += ["/usr/local/bin/aws s3 cp \($s3) /tmp/"+$jira+"/scripts/ --region "+$r, "chmod +x /tmp/"+$jira+"/scripts/'"$F"'"]')
+            done
+            echo "$CMDS" > commands_sql.json
+
+            CMD_ID=$(aws ssm send-command \
+              --document-name "AWS-RunShellScript" \
+              --instance-ids "$SQL_INSTANCE_ID" \
+              --comment "Copy SQL scripts" \
+              --parameters file://commands_sql.json \
+              --region "$REGION" \
+              --query 'Command.CommandId' --output text)
+            echo "🆔 CommandId (SQL): $CMD_ID"
+            if [[ -z "$CMD_ID" || "$CMD_ID" = "None" ]]; then echo "❌ send-command failed for SQL"; FAIL_LIST+=("SQL:SCRIPTS:SENDCMD"); else
+              if ! aws ssm wait command-executed --command-id "$CMD_ID" --instance-id "$SQL_INSTANCE_ID" --region "$REGION"; then
+                aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$SQL_INSTANCE_ID" --region "$REGION" --output json \
+                  | jq '{Status,StatusDetails,Stdout:.StandardOutputContent,Stderr:.StandardErrorContent}'
+                echo "❌ SQL scripts copy failed"; FAIL_LIST+=("SQL:SCRIPTS:EXEC:$SQL_INSTANCE_ID")
+              else
+                RES=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$SQL_INSTANCE_ID" --region "$REGION" --output json)
+                ST=$(echo "$RES" | jq -r '.Status')
+                SE=$(echo "$RES" | jq -r '.StandardErrorContent // ""')
+                echo "$RES" | jq '{Status,StatusDetails}'
+                if [[ "$ST" != "Success" && "$ST" != "InProgress" ]]; then echo "❌ SQL SSM status: $ST"; FAIL_LIST+=("SQL:SCRIPTS:STATUS:$ST"); else
+                  if echo "$SE" | grep -qi 'AccessDenied\|Forbidden\|NoSuchKey\|error'; then echo "❌ SQL STDERR:"; echo "$SE"; FAIL_LIST+=("SQL:SCRIPTS:STDERR"); else
+                    echo "✅ SQL scripts copied to $SQL_INSTANCE_ID"; SUCCESS_LIST+=("SQL:SCRIPTS:$SQL_INSTANCE_ID")
+                  fi
+                fi
+              fi
+            fi
+          fi
+        else
+          echo "No DatabaseSql in deploy — skipping SQL scripts."
+        fi
+
+        echo "🧩 Copying WAR scripts per WAR component (backup & deploy)..."
+      
+        set -euo pipefail
+        if [[ -s war_map.txt ]]; then
+          S3_SCRIPT_BASE="s3://smartstream-environment-file-transfer-bucket/release-management/common-scripts"
+          while read -r COMP IID; do
+            if [[ -z "${IID:-}" || "$IID" == "null" ]]; then
+              echo "⚠️ Skipping blank/bad IID line: COMP='$COMP' IID='$IID'"; FAIL_LIST+=("WAR:$COMP:BAD_IID"); continue
+            fi
+
+            CMDS=$(jq -n \
+              --arg jira "$JIRA_ID" \
+              --arg region "$REGION" \
+              --arg s3a "$S3_SCRIPT_BASE/backup-war.sh" \
+              --arg s3b "$S3_SCRIPT_BASE/deploy-war.sh" \
+              '{commands: [
+                "set -euo pipefail",
+                "mkdir -p /tmp/" + $jira + "/scripts",
+                "/usr/local/bin/aws s3 cp \($s3a) /tmp/" + $jira + "/scripts/ --region " + $region,
+                "/usr/local/bin/aws s3 cp \($s3b) /tmp/" + $jira + "/scripts/ --region " + $region,
+                "chmod +x /tmp/" + $jira + "/scripts/backup-war.sh",
+                "chmod +x /tmp/" + $jira + "/scripts/deploy-war.sh"
+              ]}')
+            echo "$CMDS" > commands_war.json
+
+            CMD_ID=$(aws ssm send-command \
+              --document-name "AWS-RunShellScript" \
+              --instance-ids "$IID" \
+              --comment "Copy WAR scripts (backup & deploy) for $COMP" \
+              --parameters file://commands_war.json \
+              --region "$REGION" \
+              --query 'Command.CommandId' --output text)
+            echo "🆔 CommandId ($COMP/$IID): $CMD_ID"
+            if [[ -z "$CMD_ID" || "$CMD_ID" = "None" ]]; then echo "❌ send-command failed for $COMP/$IID"; FAIL_LIST+=("WAR:$COMP:SSM_SEND"); continue; fi
+
+            if ! aws ssm wait command-executed --command-id "$CMD_ID" --instance-id "$IID" --region "$REGION"; then
+              aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$IID" --region "$REGION" --output json \
+                | jq '{Status,StatusDetails,Stdout:.StandardOutputContent,Stderr:.StandardErrorContent}'
+              echo "❌ WAR script copy failed for $COMP ($IID)"; FAIL_LIST+=("WAR:$COMP:$IID:EXEC"); continue
+            fi
+
+            RES=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$IID" --region "$REGION" --output json)
+            ST=$(echo "$RES" | jq -r '.Status')
+            SE=$(echo "$RES" | jq -r '.StandardErrorContent // ""')
+            echo "$RES" | jq '{Status,StatusDetails}'
+            if [[ "$ST" != "Success" && "$ST" != "InProgress" ]]; then echo "❌ WAR SSM status: $ST"; FAIL_LIST+=("WAR:$COMP:$IID:STATUS:$ST"); continue; fi
+            if echo "$SE" | grep -qi 'AccessDenied\|Forbidden\|NoSuchKey\|error'; then echo "❌ WAR STDERR:"; echo "$SE"; FAIL_LIST+=("WAR:$COMP:$IID:STDERR"); continue; fi
+
+            echo "✅ WAR scripts (backup & deploy) copied for $COMP ($IID)"
+            SUCCESS_LIST+=("WAR:$COMP:$IID")
+          done < war_map.txt
+          echo "✅ WAR script copy complete for all components"
+        else
+          echo "ℹ️ No WAR components mapped — skipping WAR scripts."
+        fi
+
+        echo "🧩 Copying LINUX scripts per component (backup-linux & deploy-linux)..."
+      
+          set -euo pipefail
+          if [[ -s linux_map.txt ]]; then
+            S3_SCRIPT_BASE="s3://smartstream-environment-file-transfer-bucket/release-management/common-scripts"
+            while read -r COMP IID; do
+              if [[ -z "${IID:-}" || "$IID" == "null" ]]; then
+                echo "⚠️ Skipping blank/bad IID line: COMP='$COMP' IID='$IID'"; FAIL_LIST+=("LINUX:$COMP:BAD_IID"); continue
+              fi
+
+              CMDS=$(jq -n \
+                --arg jira "$JIRA_ID" \
+                --arg region "$REGION" \
+                --arg s3a "$S3_SCRIPT_BASE/backup-linux.sh" \
+                --arg s3b "$S3_SCRIPT_BASE/deploy-linux.sh" \
+                '{commands: [
+                  "set -euo pipefail",
+                  "mkdir -p /tmp/" + $jira + "/scripts",
+                  "/usr/local/bin/aws s3 cp \($s3a) /tmp/" + $jira + "/scripts/ --region " + $region,
+                  "/usr/local/bin/aws s3 cp \($s3b) /tmp/" + $jira + "/scripts/ --region " + $region,
+                  "chmod +x /tmp/" + $jira + "/scripts/backup-linux.sh",
+                  "chmod +x /tmp/" + $jira + "/scripts/deploy-linux.sh"
+                ]}')
+              echo "$CMDS" > commands_linux.json
+
+              CMD_ID=$(aws ssm send-command \
+                --document-name "AWS-RunShellScript" \
+                --instance-ids "$IID" \
+                --comment "Copy LINUX scripts (backup & deploy) for $COMP" \
+                --parameters file://commands_linux.json \
+                --region "$REGION" \
+                --query 'Command.CommandId' --output text)
+              echo "🆔 CommandId ($COMP/$IID): $CMD_ID"
+              if [[ -z "$CMD_ID" || "$CMD_ID" = "None" ]]; then echo "❌ send-command failed for $COMP/$IID"; FAIL_LIST+=("LINUX:$COMP:SSM_SEND"); continue; fi
+
+              if ! aws ssm wait command-executed --command-id "$CMD_ID" --instance-id "$IID" --region "$REGION"; then
+                aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$IID" --region "$REGION" --output json \
+                  | jq '{Status,StatusDetails,Stdout:.StandardOutputContent,Stderr:.StandardErrorContent}'
+                echo "❌ LINUX script copy failed for $COMP ($IID)"; FAIL_LIST+=("LINUX:$COMP:$IID:EXEC"); continue
+              fi
+
+              RES=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$IID" --region "$REGION" --output json)
+              ST=$(echo "$RES" | jq -r '.Status')
+              SE=$(echo "$RES" | jq -r '.StandardErrorContent // ""')
+              echo "$RES" | jq '{Status,StatusDetails}'
+              if [[ "$ST" != "Success" && "$ST" != "InProgress" ]]; then echo "❌ LINUX SSM status: $ST"; FAIL_LIST+=("LINUX:$COMP:$IID:STATUS:$ST"); continue; fi
+              if echo "$SE" | grep -qi 'AccessDenied\|Forbidden\|NoSuchKey\|error'; then echo "❌ LINUX STDERR:"; echo "$SE"; FAIL_LIST+=("LINUX:$COMP:$IID:STDERR"); continue; fi
+
+              echo "✅ LINUX scripts (backup & deploy) copied for $COMP ($IID)"
+              SUCCESS_LIST+=("LINUX:$COMP:$IID")
+            done < linux_map.txt
+            echo "✅ LINUX script copy complete for all components"
+          else
+            echo "ℹ️ No LINUX components mapped — skipping LINUX scripts."
+          fi
+
+        # ===================================
+        # 3) CONTROL: copy utilities tool*.zip (direct copy of tool.zip), unzip, remove zip; copy control helper scripts
+        # ===================================
+        echo "🧩 Copying CONTROL utilities & helper scripts per CONTROL component..."
+      
+        set -euo pipefail
+        if [[ -s control_map.txt ]]; then
+          # S3 paths
+          UTIL_BUCKET="smartstream-environment-file-transfer-bucket"
+          UTIL_PREFIX="release-management/utilities/${VERSION}"
+          S3_UTIL_BASE="s3://${UTIL_BUCKET}/${UTIL_PREFIX}"
+          S3_SCRIPT_BASE="s3://smartstream-environment-file-transfer-bucket/release-management/common-scripts"
+
+          while read -r COMP IID; do
+            # sanitize instance id
+            CLEAN_IID=$(echo "$IID" | tr -d '[:space:]' | grep -oE '^i-[a-f0-9]{8,17}$' || true)
+            if [[ -z "${CLEAN_IID:-}" ]]; then
+              echo "⚠️ Skipping invalid CONTROL instance ID: COMP='$COMP' IID='$IID'"
+              FAIL_LIST+=("CONTROL:$COMP:INVALID_IID:$IID")
+              continue
+            fi
+
+            echo "➡️ Preparing CONTROL copy for $COMP → $CLEAN_IID"
+
+            # Extract version number from RP-3.3.0 format (fallback 0.0.0)
+            VERSION_NUMBER=$(echo "$VERSION" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "0.0.0")
+
+            # --- generate commands_control.json (SSM payload) ---
+            cat > commands_control.json <<'JSON'
+        {
+          "commands": [
+            "set -euxo pipefail",
+            "echo \"SSM_START_MARKER: VERSION=__VERSION_NUMBER__ S3_UTIL_BASE=__S3_UTIL_BASE__ S3_SCRIPT_BASE=__S3_SCRIPT_BASE__\"",
+            "mkdir -p /tmp/__JIRA__/utilities/control",
+            "mkdir -p /tmp/__JIRA__/scripts",
+            "",
+            "# download tool.zip (stdout/stderr into files)",
+            "echo \"ACTION: aws s3 cp __S3_UTIL_BASE__/tool.zip -> /tmp/__JIRA__/utilities/control/tool.zip\"",
+            "/usr/local/bin/aws s3 cp __S3_UTIL_BASE__/tool.zip /tmp/__JIRA__/utilities/control/tool.zip --region __REGION__ > /tmp/ssm_s3_tool_stdout.log 2> /tmp/ssm_s3_tool_stderr.log || true",
+            "echo \"EXITCODE_AWS_S3_CP_TOOL: $?\"",
+            "echo \"--- aws s3 cp stdout (first 200 lines) ---\"; sed -n '1,200p' /tmp/ssm_s3_tool_stdout.log || true",
+            "echo \"--- aws s3 cp stderr (first 200 lines) ---\"; sed -n '1,200p' /tmp/ssm_s3_tool_stderr.log || true",
+            "if [[ -f /tmp/__JIRA__/utilities/control/tool.zip ]]; then echo \"✅ tool.zip downloaded: /tmp/__JIRA__/utilities/control/tool.zip (size: $(stat -c%s /tmp/__JIRA__/utilities/control/tool.zip 2>/dev/null || echo 0) bytes)\"; else echo \"❌ tool.zip missing after s3 cp\"; fi",
+            "",
+            "# unzip and save logs",
+            "echo \"ACTION: unzip -o /tmp/__JIRA__/utilities/control/tool.zip -d /tmp/__JIRA__/utilities/control/\"",
+            "unzip -o /tmp/__JIRA__/utilities/control/tool.zip -d /tmp/__JIRA__/utilities/control/ > /tmp/ssm_unzip_stdout.log 2> /tmp/ssm_unzip_stderr.log || true",
+            "echo \"EXITCODE_UNZIP: $?\"",
+            "echo \"--- unzip stdout (first 200 lines) ---\"; sed -n '1,200p' /tmp/ssm_unzip_stdout.log || true",
+            "echo \"--- unzip stderr (first 200 lines) ---\"; sed -n '1,200p' /tmp/ssm_unzip_stderr.log || true",
+            "rm -f /tmp/__JIRA__/utilities/control/tool.zip || true",
+            "",
+            "# find tools directory",
+            "echo \"ACTION: find /tmp/__JIRA__/utilities/control -maxdepth 1 -type d -name 'tools*' -print\"",
+            "find /tmp/__JIRA__/utilities/control -maxdepth 1 -type d -name 'tools*' -print > /tmp/ssm_find_tools.out || true",
+            "echo \"FIND_RAW_OUTPUT:\"; sed -n '1,100p' /tmp/ssm_find_tools.out || true",
+            "TOOL_DIR=$(sed -n '1p' /tmp/ssm_find_tools.out || true)",
+            "echo \"TOOL_DIR_VAR: '${TOOL_DIR:-}'\"",
+            "if [[ -n \"${TOOL_DIR:-}\" ]]; then",
+            "  echo \"Found tools directory: $TOOL_DIR\"",
+            "  ls -la \"$TOOL_DIR\" || true",
+            "  chmod +x \"$TOOL_DIR\"/* || true",
+            "  echo \"✅ tool.zip copied, unzipped, and removed\"",
+            "else",
+            "  echo \"⚠️ No tools directory found after unzip (TOOL_DIR empty)\"",
+            "fi",
+            "",
+            "# show parent dir",
+            "echo \"📁 /tmp/__JIRA__/utilities/control contents:\"",
+            "ls -la /tmp/__JIRA__/utilities/control || echo \"⚠️ Could not list /tmp/__JIRA__/utilities/control\"",
+            "",
+            "# version-specific certificate handling",
+            "echo \"ACTION: certificate copy check for version __VERSION_NUMBER__\"",
+            "if [[ \"__VERSION_NUMBER__\" =~ ^([0-9]+)\\.([0-9]+) ]]; then",
+            "  MAJOR=${BASH_REMATCH[1]}",
+            "  MINOR=${BASH_REMATCH[2]}",
+            "  echo \"VERSION_PARSED: MAJOR=$MAJOR MINOR=$MINOR\"",
+            "  if [[ $MAJOR -gt 3 ]] || [[ $MAJOR -eq 3 && $MINOR -ge 3 ]]; then",
+            "    echo \"Version __VERSION_NUMBER__ is >= 3.3 - attempting to copy certificate files from __JBOSS_PATH__/cert/new -> $TOOL_DIR\"",
+            "    if [[ -n \"${TOOL_DIR:-}\" ]]; then",
+            "      cp \"__JBOSS_PATH__/cert/new/tlmondemand.keystore\" \"$TOOL_DIR/\" > /tmp/cp_keystore_stdout 2>/tmp/cp_keystore_stderr || true; RC1=$?",
+            "      echo \"EXITCODE_CP_KEYSTORE: $RC1\"",
+            "      echo \"--- cp_keystore stderr ---\"; sed -n '1,200p' /tmp/cp_keystore_stderr || true",
+            "      if [[ $RC1 -eq 0 && -f \"$TOOL_DIR/tlmondemand.keystore\" ]]; then echo \"✅ tlmondemand.keystore copied to $TOOL_DIR (size: $(stat -c%s \"$TOOL_DIR/tlmondemand.keystore\" 2>/dev/null || echo 0) bytes)\"; else echo \"❌ tlmondemand.keystore missing after cp (rc=$RC1)\"; fi",
+            "      cp \"__JBOSS_PATH__/cert/new/tlmondemand_TrustStore.jks\" \"$TOOL_DIR/\" > /tmp/cp_trust_stdout 2>/tmp/cp_trust_stderr || true; RC2=$?",
+            "      echo \"EXITCODE_CP_TRUST: $RC2\"",
+            "      echo \"--- cp_trust stderr ---\"; sed -n '1,200p' /tmp/cp_trust_stderr || true",
+            "      if [[ $RC2 -eq 0 && -f \"$TOOL_DIR/tlmondemand_TrustStore.jks\" ]]; then echo \"✅ tlmondemand_TrustStore.jks copied to $TOOL_DIR (size: $(stat -c%s \"$TOOL_DIR/tlmondemand_TrustStore.jks\" 2>/dev/null || echo 0) bytes)\"; else echo \"❌ tlmondemand_TrustStore.jks missing after cp (rc=$RC2)\"; fi",
+            "      if [[ -f \"$TOOL_DIR/tlmondemand.keystore\" ]]; then md5sum \"$TOOL_DIR/tlmondemand.keystore\" || true; fi",
+            "      if [[ -f \"$TOOL_DIR/tlmondemand_TrustStore.jks\" ]]; then md5sum \"$TOOL_DIR/tlmondemand_TrustStore.jks\" || true; fi",
+            "",
+            "      # --- prepare controlutil.sh: backup, sed inject placeholder password & auth-token ---",
+            "      echo \"ACTION: prepare controlutil.sh (backup, sed inject placeholder password & auth-token)\"",
+            "      if [[ -f \"$TOOL_DIR/controlutil.sh\" ]]; then",
+            "        echo \"Backing up existing controlutil.sh -> controlutil.sh.bak\"",
+            "        cp \"$TOOL_DIR/controlutil.sh\" \"$TOOL_DIR/controlutil.sh.bak\" || true",
+            "        echo \"Running sed to inject export PASSWORD and java invocation with placeholders\"",
+            "        sed -i \"/com.smartstream.control.tools.commandline.ControlUtil/ c\\",
+            "export PASSWORD='__KEYSTORE_PASS__'\\\\n\\",
+            "\\\"\\$JAVA_HOME/bin/java\\\" -Xms64m -Xmx1024m -Dlogback.configurationFile=./properties/logback.xml -Dtcengine.rpc.keystore=\\\"tlmondemand.keystore\\\" -Dtcengine.rpc.truststore=\\\"tlmondemand_TrustStore.jks\\\" -Dtcengine.rpc.auth-token='__AUTHTOKEN_PASS__' -Dtcengine.rpc.keystore-password=\\$PASSWORD -Dtcengine.rpc.truststore-password=\\$PASSWORD -Dtcengine.rpc.call-timeout=1500000 -Dtcengine.rpc.max-inbound-message-size=1160363328 -DenableSecureLogging=false -cp \\$CLASSPATH com.smartstream.control.tools.commandline.ControlUtil \\\"\\$@\\\" \" \"$TOOL_DIR/controlutil.sh\" || true",
+            "        chmod 775 \"$TOOL_DIR/controlutil.sh\" || true",
+            "        echo \"--- controlutil.sh (first 40 lines) ---\"; sed -n '1,40p' \"$TOOL_DIR/controlutil.sh\" || true",
+            "      else",
+            "        echo \"⚠️ $TOOL_DIR/controlutil.sh not found — skipping sed injection\"",
+            "      fi",
+            "",
+            "    else",
+            "      echo \"⚠️ Cannot copy certificate files because TOOL_DIR is empty\"",
+            "    fi",
+            "  else",
+            "    echo \"Version __VERSION_NUMBER__ is below 3.3 - skipping certificate file copy\"",
+            "  fi",
+            "else",
+            "  echo \"⚠️ Could not parse version __VERSION_NUMBER__ - skipping certificate file copy\"",
+            "fi",
+            "",
+            "# copy helper scripts from S3 (log each stdout/stderr)",
+            "echo \"ACTION: copy helper scripts from __S3_SCRIPT_BASE__ to /tmp/__JIRA__/scripts/\"",
+            "/usr/local/bin/aws s3 cp __S3_SCRIPT_BASE__/backup-modularexport.sh /tmp/__JIRA__/scripts/ --region __REGION__ > /tmp/ssm_cp_backup_stdout 2> /tmp/ssm_cp_backup_stderr || true; echo \"EXITCODE_CP_BACKUP: $?\"",
+            "echo \"--- backup cp stderr ---\"; sed -n '1,200p' /tmp/ssm_cp_backup_stderr || true",
+            "/usr/local/bin/aws s3 cp __S3_SCRIPT_BASE__/deploy-modularimport.sh /tmp/__JIRA__/scripts/ --region __REGION__ > /tmp/ssm_cp_import_stdout 2> /tmp/ssm_cp_import_stderr || true; echo \"EXITCODE_CP_IMPORT: $?\"",
+            "echo \"--- import cp stderr ---\"; sed -n '1,200p' /tmp/ssm_cp_import_stderr || true",
+            "/usr/local/bin/aws s3 cp __S3_SCRIPT_BASE__/deploy-granularimport.sh /tmp/__JIRA__/scripts/ --region __REGION__ > /tmp/ssm_cp_granular_stdout 2> /tmp/ssm_cp_granular_stderr || true; echo \"EXITCODE_CP_GRANULAR: $?\"",
+            "echo \"--- granular cp stderr ---\"; sed -n '1,200p' /tmp/ssm_cp_granular_stderr || true",
+            "",
+            "chmod +x /tmp/__JIRA__/scripts/backup-modularexport.sh || true",
+            "chmod +x /tmp/__JIRA__/scripts/deploy-modularimport.sh || true",
+            "chmod +x /tmp/__JIRA__/scripts/deploy-granularimport.sh || true",
+            "",
+            "echo \"📁 /tmp/__JIRA__/scripts contents:\"",
+            "ls -la /tmp/__JIRA__/scripts || echo \"⚠️ Could not list /tmp/__JIRA__/scripts\"",
+            "",
+            "echo \"SSM_END_MARKER: CONTROL_COPY_COMPLETE\""
+          ]
+        }
+        JSON
+
+            # Replace placeholders in the commands_control.json
+            sed -i "s|__JIRA__|${JIRA_ID}|g" commands_control.json
+            sed -i "s|__S3_UTIL_BASE__|${S3_UTIL_BASE}|g" commands_control.json
+            sed -i "s|__S3_SCRIPT_BASE__|${S3_SCRIPT_BASE}|g" commands_control.json
+            sed -i "s|__REGION__|${REGION}|g" commands_control.json
+            sed -i "s|__VERSION_NUMBER__|${VERSION_NUMBER}|g" commands_control.json
+            sed -i "s|__JBOSS_PATH__|${JBOSS_PATH}|g" commands_control.json
+            sed -i "s|__KEYSTORE_PASS__|${KEYSTORE_PASS}|g" commands_control.json
+            sed -i "s|__AUTHTOKEN_PASS__|${AUTHTOKEN_PASS}|g" commands_control.json
+
+            # Debug print of payload
+            echo "---- commands_control.json ----"
+            cat commands_control.json
+            echo "------------------------------"
+
+            # Send SSM command
+            CMD_ID=$(aws ssm send-command \
+              --document-name "AWS-RunShellScript" \
+              --instance-ids "$CLEAN_IID" \
+              --comment "Copy CONTROL utilities & backup-modularexport.sh for $COMP" \
+              --parameters file://commands_control.json \
+              --region "$REGION" \
+              --query 'Command.CommandId' --output text)
+
+            echo "🆔 CommandId CONTROL ($COMP/$CLEAN_IID): $CMD_ID"
+            if [[ -z "$CMD_ID" || "$CMD_ID" = "None" ]]; then
+              echo "❌ send-command failed for CONTROL $COMP/$CLEAN_IID"
+              FAIL_LIST+=("CONTROL:$COMP:$CLEAN_IID:SSM_SEND")
+              continue
+            fi
+
+            # wait for execution
+            if ! aws ssm wait command-executed --command-id "$CMD_ID" --instance-id "$CLEAN_IID" --region "$REGION"; then
+              INV=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$CLEAN_IID" --region "$REGION" --output json || true)
+              echo "❌ SSM wait failed for CONTROL $COMP/$CLEAN_IID"
+              echo "---- full invocation JSON ----"
+              echo "$INV" | jq '.' || true
+              FAIL_LIST+=("CONTROL:$COMP:$CLEAN_IID:SSM_WAIT_FAILED")
+              continue
+            fi
+
+            # fetch invocation result
+            RES=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$CLEAN_IID" --region "$REGION" --output json || true)
+            ST=$(echo "$RES" | jq -r '.Status // ""')
+            SE=$(echo "$RES" | jq -r '.StandardErrorContent // ""')
+            SO=$(echo "$RES" | jq -r '.StandardOutputContent // ""')
+
+            # Print everything to CodeBuild logs
+            echo "---- SSM Invocation FULL for $COMP/$CLEAN_IID ----"
+            echo "$RES" | jq '{Status,StatusDetails,TimedOut:.TimedOut,DocumentName:.DocumentName}' || true
+            echo "---- BEGIN STDOUT ----"
+            echo "$SO"
+            echo "---- END STDOUT ----"
+            echo "---- BEGIN STDERR ----"
+            echo "$SE"
+            echo "---- END STDERR ----"
+            echo "---- END INVOCATION ----"
+
+            # Quick markers check
+            if echo "$SO" | grep -q "SSM_START_MARKER"; then
+              echo "INFO: SSM payload started on instance (marker found)"
+            else
+              echo "WARN: SSM start marker NOT found in stdout"
+            fi
+
+            # Determine success using explicit markers emitted by the instance payload
+            if echo "$SO" | grep -qiE "Found tools directory:|✅ tool.zip downloaded|✅ tool.zip copied, unzipped, and removed|SSM_END_MARKER: CONTROL_COPY_COMPLETE"; then
+              echo "✅ CONTROL utilities prepared for $COMP on $CLEAN_IID (identified success markers in stdout)"
+              SUCCESS_LIST+=("CONTROL:$COMP:$CLEAN_IID:TOOL_COPIED")
+            else
+              # certificate copy success?
+              if echo "$SO" | grep -qi "✅ tlmondemand.keystore copied\|✅ tlmondemand_TrustStore.jks copied"; then
+                echo "✅ CONTROL certificates copied for $COMP on $CLEAN_IID"
+                SUCCESS_LIST+=("CONTROL:$COMP:$CLEAN_IID:CERT_COPIED")
+              else
+                # Check for obvious errors
+                if echo "$SE" | grep -qiE 'AccessDenied|Forbidden|NoSuchKey|Permission denied|No such file|error|ERROR'; then
+                  REASON=$(echo "$SE" | sed -n '1,1p' | tr '\n' ' ')
+                  echo "❌ CONTROL STDERR for $COMP/$CLEAN_IID: $REASON"
+                  FAIL_LIST+=("CONTROL:$COMP:$CLEAN_IID:STDERR:${REASON}")
+                  continue
+                fi
+
+                if echo "$SO" | grep -qiE '❌|WARN:|No tools directory found|missing after'; then
+                  echo "⚠️ CONTROL reported problems in stdout for $COMP/$CLEAN_IID — check above logs"
+                  if echo "$SO" | grep -qi '📁 /tmp/__JIRA__/scripts contents:\|/tmp/__JIRA__/scripts contents'; then
+                    echo "⚠️ CONTROL helper scripts present but tools missing"
+                    SUCCESS_LIST+=("CONTROL:$COMP:$CLEAN_IID:HELPER_ONLY")
+                  else
+                    echo "❌ CONTROL utilities missing and no clear helper success"
+                    FAIL_LIST+=("CONTROL:$COMP:$CLEAN_IID:TOOL_MISSING")
+                  fi
+                else
+                  echo "⚠️ CONTROL: no explicit success or failure markers detected. Stdout/stderr printed above for debugging."
+                  SUCCESS_LIST+=("CONTROL:$COMP:$CLEAN_IID:UNCLEAR")
+                fi
+              fi
+            fi
+
+          done < control_map.txt
+
+          echo "✅ CONTROL copy complete for all mapped components"
+
+          # --- copy backup-get-project-id.sh ONLY to SQL instance ---
+          if [[ -n "${SQL_INSTANCE_ID:-}" && "$SQL_INSTANCE_ID" != "null" ]]; then
+            echo "➡️ Copying backup-get-project-id.sh to SQL instance $SQL_INSTANCE_ID"
+
+            cat > commands_get_project.sql.json <<'JSON'
+        {
+          "commands":[
+            "set -euo pipefail",
+            "mkdir -p /tmp/__JIRA__/scripts",
+            "/usr/local/bin/aws s3 cp __S3_GET__ /tmp/__JIRA__/scripts/ --region __REGION__ > /tmp/ssm_getproject_stdout 2> /tmp/ssm_getproject_stderr || true",
+            "echo \"--- getproject stdout ---\"; sed -n '1,200p' /tmp/ssm_getproject_stdout || true",
+            "echo \"--- getproject stderr ---\"; sed -n '1,200p' /tmp/ssm_getproject_stderr || true",
+            "chmod +x /tmp/__JIRA__/scripts/backup-get-project-id.sh || true",
+            "echo \"✅ backup-get-project-id.sh copied to /tmp/__JIRA__/scripts on SQL instance\""
+          ]
+        }
+        JSON
+
+            sed -i "s|__JIRA__|${JIRA_ID}|g" commands_get_project.sql.json
+            sed -i "s|__S3_GET__|${S3_SCRIPT_BASE}/backup-get-project-id.sh|g" commands_get_project.sql.json
+            sed -i "s|__REGION__|${REGION}|g" commands_get_project.sql.json
+
+            echo "---- commands_get_project.sql.json ----"
+            cat commands_get_project.sql.json
+            echo "---------------------------------------"
+
+            CMD_ID_SQL=$(aws ssm send-command \
+              --document-name "AWS-RunShellScript" \
+              --instance-ids "$SQL_INSTANCE_ID" \
+              --comment "Copy backup-get-project-id.sh to SQL instance" \
+              --parameters file://commands_get_project.sql.json \
+              --region "$REGION" \
+              --query 'Command.CommandId' --output text)
+            echo "🆔 CommandId (get-project-id -> SQL): $CMD_ID_SQL"
+
+            if [[ -z "$CMD_ID_SQL" || "$CMD_ID_SQL" = "None" ]]; then
+              echo "❌ send-command failed for get-project-id -> SQL"
+              FAIL_LIST+=("CONTROL:GETPROJECT:SSM_SEND")
+            fi
+
+          else
+            echo "⚠️ SQL instance id not found. Skipping backup-get-project-id.sh copy."
+            FAIL_LIST+=("CONTROL:GETPROJECT:MISSING_SQL_INSTANCE")
+          fi
+
+        else
+          echo "No CONTROL components mapped — skipping CONTROL copy."
+        fi
+
+        # ===================================
+        # 4) CT: copy utilities (CT.tar.gz), unzip, remove zip; copy CT helper scripts
+        #    - backup-ct.sh & deploy-ct.sh -> copied to each CT instance
+        # ===================================
+        echo "🧩 Copying CT utilities & helper scripts per CT component..."
+      
+        set -euo pipefail
+
+        if [[ -s ct_map.txt ]]; then
+          # S3 paths
+          UTIL_BUCKET="smartstream-environment-file-transfer-bucket"
+          UTIL_PREFIX="release-management/utilities/${VERSION}"
+          S3_UTIL_BASE="s3://${UTIL_BUCKET}/${UTIL_PREFIX}"
+          S3_SCRIPT_BASE="s3://smartstream-environment-file-transfer-bucket/release-management/common-scripts"
+
+          while read -r COMP IID; do
+            if [[ -z "${IID:-}" || "$IID" == "null" ]]; then
+              echo "⚠️ Skipping blank/bad CT IID line: COMP='$COMP' IID='$IID'"
+              FAIL_LIST+=("CT:$COMP:BAD_IID")
+              continue
+            fi
+
+            echo "➡️ Preparing CT copy for $COMP → $IID"
+
+            # --- generate commands_ct.json ---
+            cat > commands_ct.json <<'JSON'
+
+        {
+          "commands": [
+            "set -euo pipefail",
+            "mkdir -p /tmp/__JIRA__/utilities/ConfigurationTransfer",
+            "mkdir -p /tmp/__JIRA__/scripts",
+            "# =====================",
+            "# Conditional copy logic based on VERSION",
+            "# =====================",
+            "if [ '__VERSION__' == 'RP-3.0' ] || [ '__VERSION__' = 'RP-3.1' ]; then",
+            "  echo 'Detected VERSION RP-3.0 / RP-3.1 — using CT.zip and skipping ojdbc17.jar copy'",
+            "  /usr/local/bin/aws s3 cp __S3_UTIL_BASE__/CT.zip /tmp/__JIRA__/utilities/ConfigurationTransfer/CT.zip --region __REGION__",
+            "  unzip -o /tmp/__JIRA__/utilities/ConfigurationTransfer/CT.zip -d /tmp/__JIRA__/utilities/ConfigurationTransfer/",
+            "  rm -f /tmp/__JIRA__/utilities/ConfigurationTransfer/CT.zip",
+            "  echo 'CT.zip copied, unzipped, and removed'",
+            "else",
+            "  echo 'Detected VERSION != RP-3.0 — using CT.tar.gz and copying ojdbc17.jar'",
+            "  /usr/local/bin/aws s3 cp __S3_UTIL_BASE__/CT.tar.gz /tmp/__JIRA__/utilities/ConfigurationTransfer/CT.tar.gz --region __REGION__",
+            "  tar -xf /tmp/__JIRA__/utilities/ConfigurationTransfer/CT.tar.gz -C /tmp/__JIRA__/utilities/ConfigurationTransfer/",
+            "  rm -f /tmp/__JIRA__/utilities/ConfigurationTransfer/CT.tar.gz",
+            "  echo 'CT.tar.gz copied, unzipped, and removed'",
+            "  /usr/local/bin/aws s3 cp __S3_UTIL_BASE__/ojdbc17.jar /tmp/__JIRA__/utilities/ConfigurationTransfer/drivers/ --region __REGION__",
+            "  echo 'ojdbc17.jar copied to driver folder'",
+            "fi",
+            "# Copy CT helper scripts to instance",
+            "/usr/local/bin/aws s3 cp __S3_SCRIPT_BASE__/backup-ct.sh /tmp/__JIRA__/scripts/ --region __REGION__",
+            "chmod +x /tmp/__JIRA__/scripts/backup-ct.sh || true",
+            "/usr/local/bin/aws s3 cp __S3_SCRIPT_BASE__/deploy-ct.sh /tmp/__JIRA__/scripts/ --region __REGION__",
+            "chmod +x /tmp/__JIRA__/scripts/deploy-ct.sh || true",
+            "/usr/local/bin/aws s3 cp __S3_SCRIPT_BASE__/rollback-ct.sh /tmp/__JIRA__/scripts/ --region __REGION__",
+            "chmod +x /tmp/__JIRA__/scripts/rollback-ct.sh || true",
+            "echo \"✅ CT helper scripts copied to /tmp/__JIRA__/scripts and made executable\""
+          ]
+        }
+        JSON
+
+            # Replace placeholders
+            sed -i "s|__JIRA__|${JIRA_ID}|g" commands_ct.json
+            sed -i "s|__S3_UTIL_BASE__|${S3_UTIL_BASE}|g" commands_ct.json
+            sed -i "s|__S3_SCRIPT_BASE__|${S3_SCRIPT_BASE}|g" commands_ct.json
+            sed -i "s|__REGION__|${REGION}|g" commands_ct.json
+            sed -i "s|__VERSION__|${VERSION}|g" commands_ct.json
+
+            # Debug output
+            echo "---- commands_ct.json ----"
+            cat commands_ct.json
+            echo "--------------------------"
+
+            CMD_ID=$(aws ssm send-command \
+              --document-name "AWS-RunShellScript" \
+              --instance-ids "$IID" \
+              --comment "Copy CT utilities & scripts for $COMP (VERSION=$VERSION)" \
+              --parameters file://commands_ct.json \
+              --region "$REGION" \
+              --query 'Command.CommandId' --output text)
+
+            echo "🆔 CommandId CT ($COMP/$IID): $CMD_ID VERSION=$VERSION"
+            if [[ -z "$CMD_ID" || "$CMD_ID" = "None" ]]; then
+              echo "❌ send-command failed for CT $COMP/$IID VERSION=$VERSION"
+              FAIL_LIST+=("CT:$COMP:$IID:SSM_SEND:V${VERSION}")
+              continue
+            fi
+
+        if ! aws ssm wait command-executed --command-id "$CMD_ID" --instance-id "$IID" --region "$REGION"; then
+          INV=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$IID" --region "$REGION" --output json || true)
+          OUT=$(echo "$INV" | jq -r '.StandardOutputContent // ""' | head -n1 | tr '\n' ' ')
+          ERR=$(echo "$INV" | jq -r '.StandardErrorContent // ""' | head -n1 | tr '\n' ' ')
+          echo "$INV" | jq '{Status,StatusDetails,Stdout:.StandardOutputContent,Stderr:.StandardErrorContent}'
+          echo "❌ CT copy failed for $COMP ($IID) VERSION=$VERSION"
+          FAIL_LIST+=("CT:$COMP:$IID:EXEC:V${VERSION}:${ERR:-${OUT:-SSM_WAIT_FAILED}}")
+          continue
+        fi
+
+        RES=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$IID" --region "$REGION" --output json)
+        ST=$(echo "$RES" | jq -r '.Status // ""')
+        SE=$(echo "$RES" | jq -r '.StandardErrorContent // ""')
+        SO=$(echo "$RES" | jq -r '.StandardOutputContent // ""')
+        echo "$RES" | jq '{Status,StatusDetails}'
+
+        if [[ "$ST" != "Success" && "$ST" != "InProgress" ]]; then
+          REASON=$(printf "%s" "$SE" | head -n1 | tr '\n' ' ')
+          [[ -z "$REASON" ]] && REASON=$(printf "%s" "$SO" | head -n1 | tr '\n' ' ')
+          echo "❌ CT SSM status for $COMP/$IID: $ST — ${REASON} VERSION=$VERSION"
+          FAIL_LIST+=("CT:$COMP:$IID:STATUS:${ST}:${REASON}:V${VERSION}")
+          continue
+        fi
+
+        if echo "$SE" | grep -qi 'AccessDenied\|Forbidden\|NoSuchKey\|error'; then
+          REASON=$(printf "%s" "$SE" | head -n1 | tr '\n' ' ')
+          echo "❌ CT STDERR for $COMP/$IID: $REASON VERSION=$VERSION"
+          FAIL_LIST+=("CT:$COMP:$IID:STDERR:${REASON}:V${VERSION}")
+          continue
+        fi
+
+        if echo "$SO" | grep -qi 'CT.zip copied|CT.tar.gz copied'; then
+          echo "✅ CT utilities prepared for $COMP on $IID CT.tar.gz copied/unzipped, VERSION=$VERSION"
+          SUCCESS_LIST+=("CT:$COMP:$IID:CTZIP_COPIED:V${VERSION}")
+        else
+          echo "⚠️ CT helper scripts copied but CT.tar.gz message not observed for $COMP on $IID VERSION=$VERSION"
+          SUCCESS_LIST+=("CT:$COMP:$IID:HELPER_ONLY:V${VERSION}")
+        fi
+
+        done < ct_map.txt
+
+        echo "✅ CT copy complete for all mapped components VERSION=$VERSION"
+        else
+          echo "No CT components mapped — skipping CT copy VERSION=$VERSION"
+        fi
+
+        # ===================================
+        # 5) TLM_VIEW: copy  config-manager.jar utility + tlmview scripts (backup-tlmview.sh, deploy-tlmview.sh)
+        # ===================================
+        echo "🧩 Copying TLM_VIEW utility (config-manager.jar) & scripts per TLM_VIEW component..."
+      
+        set -euo pipefail
+        if [[ -s tlm_view_map.txt ]]; then
+          UTIL_BUCKET="smartstream-environment-file-transfer-bucket"
+          UTIL_PREFIX="release-management/utilities/${VERSION}"
+          S3_UTIL_BASE="s3://${UTIL_BUCKET}/${UTIL_PREFIX}"
+          S3_SCRIPT_BASE="s3://smartstream-environment-file-transfer-bucket/release-management/common-scripts"
+
+          while read -r COMP IID; do
+            if [[ -z "${IID:-}" || "$IID" == "null" ]]; then
+              echo "⚠️ Skipping blank/bad TLM_VIEW IID line: COMP='$COMP' IID='$IID'"; FAIL_LIST+=("TLM_VIEW:$COMP:BAD_IID"); continue
+            fi
+
+            echo "➡️ Preparing TLM_VIEW copy for $COMP → $IID"
+
+            # --- generate commands_tlmview.json ---
+            cat > commands_tlmview.json <<'JSON'
+        {
+          "commands": [
+            "set -euo pipefail",
+            "mkdir -p /tmp/__JIRA__/utilities/TLMView",
+            "mkdir -p /tmp/__JIRA__/scripts",
+            "# Copy config-manager.jar directly to utilities folder",
+            "/usr/local/bin/aws s3 cp __S3_UTIL_BASE__/config-manager.jar /tmp/__JIRA__/utilities/TLMView/config-manager.jar --region __REGION__",
+            "echo \"✅ config-manager.jar copied\"",
+            "# Copy TLM_VIEW helper scripts",
+            "/usr/local/bin/aws s3 cp __S3_SCRIPT_BASE__/backup-tlmview.sh /tmp/__JIRA__/scripts/ --region __REGION__",
+            "/usr/local/bin/aws s3 cp __S3_SCRIPT_BASE__/deploy-tlmview.sh /tmp/__JIRA__/scripts/ --region __REGION__",
+            "/usr/local/bin/aws s3 cp __S3_SCRIPT_BASE__/rollback-tlmview.sh /tmp/__JIRA__/scripts/ --region __REGION__",
+            "chmod +x /tmp/__JIRA__/scripts/backup-tlmview.sh || true",
+            "chmod +x /tmp/__JIRA__/scripts/deploy-tlmview.sh || true",
+            "chmod +x /tmp/__JIRA__/scripts/rollback-tlmview.sh || true",
+            "echo \"✅ tlmview scripts copied to /tmp/__JIRA__/scripts and made executable\""
+          ]
+        }
+        JSON
+
+            # Replace placeholders
+            sed -i "s|__JIRA__|${JIRA_ID}|g" commands_tlmview.json
+            sed -i "s|__S3_UTIL_BASE__|${S3_UTIL_BASE}|g" commands_tlmview.json
+            sed -i "s|__S3_SCRIPT_BASE__|${S3_SCRIPT_BASE}|g" commands_tlmview.json
+            sed -i "s|__REGION__|${REGION}|g" commands_tlmview.json
+
+            CMD_ID=$(aws ssm send-command \
+              --document-name "AWS-RunShellScript" \
+              --instance-ids "$IID" \
+              --comment "Copy TLM_VIEW utility & scripts for $COMP" \
+              --parameters file://commands_tlmview.json \
+              --region "$REGION" \
+              --query 'Command.CommandId' --output text)
+
+            echo "🆔 CommandId TLM_VIEW ($COMP/$IID): $CMD_ID"
+            if [[ -z "$CMD_ID" || "$CMD_ID" = "None" ]]; then
+              echo "❌ send-command failed for TLM_VIEW $COMP/$IID"
+              FAIL_LIST+=("TLM_VIEW:$COMP:$IID:SSM_SEND")
+              continue
+            fi
+
+            if ! aws ssm wait command-executed --command-id "$CMD_ID" --instance-id "$IID" --region "$REGION"; then
+              echo "❌ TLM_VIEW copy failed for $COMP ($IID)"
+              FAIL_LIST+=("TLM_VIEW:$COMP:$IID:EXEC")
+              continue
+            fi
+
+            echo "✅ TLM_VIEW utility & scripts prepared for $COMP on $IID"
+            SUCCESS_LIST+=("TLM_VIEW:$COMP:$IID")
+          done < tlm_view_map.txt
+
+          echo "✅ TLM_VIEW copy complete for all mapped components"
+        else
+          echo "No TLM_VIEW components mapped — skipping TLM_VIEW copy."
+        fi
+
+        # ===================================
+        # 6) STATIC: copy static scripts only (backup-static.sh, deploy-static.sh)
+        # ===================================
+        echo "🧩 Copying STATIC scripts per component..."
+      
+        set -euo pipefail
+        if [[ -s static_map.txt ]]; then
+          S3_SCRIPT_BASE="s3://smartstream-environment-file-transfer-bucket/release-management/common-scripts"
+
+          while read -r COMP IID; do
+            if [[ -z "${IID:-}" || "$IID" == "null" ]]; then
+              echo "⚠️ Skipping blank/bad STATIC IID line: COMP='$COMP' IID='$IID'"; FAIL_LIST+=("STATIC:$COMP:BAD_IID"); continue
+            fi
+
+            echo "➡️ Preparing STATIC copy for $COMP → $IID"
+
+            # --- generate commands_static.json ---
+            cat > commands_static.json <<'JSON'
+        {
+          "commands": [
+            "set -euo pipefail",
+            "mkdir -p /tmp/__JIRA__/scripts",
+            "# Copy STATIC helper scripts",
+            "/usr/local/bin/aws s3 cp __S3_SCRIPT_BASE__/backup-static.sh /tmp/__JIRA__/scripts/ --region __REGION__",
+            "/usr/local/bin/aws s3 cp __S3_SCRIPT_BASE__/deploy-static.sh /tmp/__JIRA__/scripts/ --region __REGION__",
+            "chmod +x /tmp/__JIRA__/scripts/backup-static.sh || true",
+            "chmod +x /tmp/__JIRA__/scripts/deploy-static.sh || true",
+            "echo \"✅ static scripts copied to /tmp/__JIRA__/scripts and made executable\""
+          ]
+        }
+        JSON
+
+            # Replace placeholders
+            sed -i "s|__JIRA__|${JIRA_ID}|g" commands_static.json
+            sed -i "s|__S3_SCRIPT_BASE__|${S3_SCRIPT_BASE}|g" commands_static.json
+            sed -i "s|__REGION__|${REGION}|g" commands_static.json
+
+            CMD_ID=$(aws ssm send-command \
+              --document-name "AWS-RunShellScript" \
+              --instance-ids "$IID" \
+              --comment "Copy STATIC scripts for $COMP" \
+              --parameters file://commands_static.json \
+              --region "$REGION" \
+              --query 'Command.CommandId' --output text)
+
+            echo "🆔 CommandId STATIC ($COMP/$IID): $CMD_ID"
+            if [[ -z "$CMD_ID" || "$CMD_ID" = "None" ]]; then
+              echo "❌ send-command failed for STATIC $COMP/$IID"
+              FAIL_LIST+=("STATIC:$COMP:$IID:SSM_SEND")
+              continue
+            fi
+
+            if ! aws ssm wait command-executed --command-id "$CMD_ID" --instance-id "$IID" --region "$REGION"; then
+              echo "❌ STATIC copy failed for $COMP ($IID)"
+              FAIL_LIST+=("STATIC:$COMP:$IID:EXEC")
+              continue
+            fi
+
+            echo "✅ STATIC scripts prepared for $COMP on $IID"
+            SUCCESS_LIST+=("STATIC:$COMP:$IID")
+          done < static_map.txt
+
+          echo "✅ STATIC copy complete for all mapped components"
+        else
+          echo "No STATIC components mapped — skipping STATIC copy."
+        fi
+
+     
+
+        # ===================================
+        # 8) SYNTAX-CT: copy utilities installer.zip, unzip, remove zip; copy syntax-ct helper scripts
+        # ===================================
+        echo "🧩 Copying SYNTAX-CT utilities & helper scripts per SYNTAX-CT component..."
+      
+        set -euo pipefail
+        if [[ -s syntaxct_map.txt ]]; then
+          # S3 paths
+          UTIL_BUCKET="smartstream-environment-file-transfer-bucket"
+          UTIL_PREFIX="release-management/utilities/${VERSION}"
+          S3_UTIL_BASE="s3://${UTIL_BUCKET}/${UTIL_PREFIX}"
+          S3_SCRIPT_BASE="s3://smartstream-environment-file-transfer-bucket/release-management/common-scripts"
+
+          while read -r COMP IID; do
+            # sanitize instance id
+            CLEAN_IID=$(echo "$IID" | tr -d '[:space:]' | grep -oE '^i-[a-f0-9]{8,17}$' || true)
+            if [[ -z "${CLEAN_IID:-}" ]]; then
+              echo "⚠️ Skipping invalid SYNTAX-CT instance ID: COMP='$COMP' IID='$IID'"
+              FAIL_LIST+=("SYNTAX-CT:$COMP:INVALID_IID:$IID")
+              continue
+            fi
+
+            echo "➡️ Preparing SYNTAX-CT copy for $COMP → $CLEAN_IID"
+
+            # --- generate commands_syntaxct.json (SSM payload) ---
+            cat > commands_syntaxct.json <<'JSON'
+        {
+          "commands": [
+            "set -euxo pipefail",
+            "echo \"SSM_START_MARKER: VERSION=__VERSION__ S3_UTIL_BASE=__S3_UTIL_BASE__ S3_SCRIPT_BASE=__S3_SCRIPT_BASE__\"",
+            "mkdir -p /tmp/__JIRA__/utilities/syntax-ct",
+            "mkdir -p /tmp/__JIRA__/scripts",
+            "",
+            "# download installer.zip (stdout/stderr into files)",
+            "echo \"ACTION: aws s3 cp __S3_UTIL_BASE__/installer.zip -> /tmp/__JIRA__/utilities/syntax-ct/installer.zip\"",
+            "/usr/local/bin/aws s3 cp __S3_UTIL_BASE__/installer.zip /tmp/__JIRA__/utilities/syntax-ct/installer.zip --region __REGION__ > /tmp/ssm_s3_installer_stdout.log 2> /tmp/ssm_s3_installer_stderr.log || true",
+            "echo \"EXITCODE_AWS_S3_CP_INSTALLER: $?\"",
+            "echo \"--- aws s3 cp stdout (first 200 lines) ---\"; sed -n '1,200p' /tmp/ssm_s3_installer_stdout.log || true",
+            "echo \"--- aws s3 cp stderr (first 200 lines) ---\"; sed -n '1,200p' /tmp/ssm_s3_installer_stderr.log || true",
+            "if [[ -f /tmp/__JIRA__/utilities/syntax-ct/installer.zip ]]; then echo \"✅ installer.zip downloaded: /tmp/__JIRA__/utilities/syntax-ct/installer.zip (size: $(stat -c%s /tmp/__JIRA__/utilities/syntax-ct/installer.zip 2>/dev/null || echo 0) bytes)\"; else echo \"❌ installer.zip missing after s3 cp\"; fi",
+            "",
+            "# unzip and save logs",
+            "echo \"ACTION: unzip -o /tmp/__JIRA__/utilities/syntax-ct/installer.zip -d /tmp/__JIRA__/utilities/syntax-ct/\"",
+            "unzip -o /tmp/__JIRA__/utilities/syntax-ct/installer.zip -d /tmp/__JIRA__/utilities/syntax-ct/ > /tmp/ssm_unzip_stdout.log 2> /tmp/ssm_unzip_stderr.log || true",
+            "echo \"EXITCODE_UNZIP: $?\"",
+            "echo \"--- unzip stdout (first 200 lines) ---\"; sed -n '1,200p' /tmp/ssm_unzip_stdout.log || true",
+            "echo \"--- unzip stderr (first 200 lines) ---\"; sed -n '1,200p' /tmp/ssm_unzip_stderr.log || true",
+            "rm -f /tmp/__JIRA__/utilities/syntax-ct/installer.zip || true",
+            "",
+            "# find installer directory",
+            "echo \"ACTION: find /tmp/__JIRA__/utilities/syntax-ct -maxdepth 1 -type d -name 'installer*' -print\"",
+            "find /tmp/__JIRA__/utilities/syntax-ct/installer/ -maxdepth 1 -type d -name 'installer*' -print > /tmp/ssm_find_installer.out || true",
+            "echo \"FIND_RAW_OUTPUT:\"; cat /tmp/ssm_find_installer.out || true",
+            "INSTALLER_DIR=$(sed -n '1p' /tmp/ssm_find_installer.out || true)",
+            "echo \"INSTALLER_DIR_VAR: '${INSTALLER_DIR:-}'\"",
+            "if [[ -n \"${INSTALLER_DIR:-}\" ]]; then",
+            "  echo \"Found installer directory: $INSTALLER_DIR\"",
+            "  ls -la \"$INSTALLER_DIR\" || true",
+            "  # Change to installer directory and set permissions for ALL files (not directories)",
+            "  cd \"$INSTALLER_DIR\" || { echo \"⚠️ Failed to cd to $INSTALLER_DIR\"; exit 1; }",
+            "  echo \"Changed to directory: $(pwd)\"",
+            "  echo \"Setting execute permissions for all regular files in installer directory...\"",
+            "  # Set execute permissions for all regular files (not directories)",
+            "  find . -maxdepth 1 -type f -exec chmod 755 {} + || { echo \"⚠️ Some files failed permission change but continuing...\"; }",
+            "  echo \"✅ Execute permissions set for all regular files in installer directory\"",
+            "  echo \"Current directory contents with permissions:\"",
+            "  ls -la || true",
+            "  echo \"Checking installer file specifically:\"",
+            "  if [[ -f \"installer\" ]]; then",
+            "    ls -la \"installer\" || true",
+            "    echo \"✅ installer file is present and executable\"",
+            "  else",
+            "    echo \"⚠️ installer file not found, listing all files:\"",
+            "    find . -maxdepth 1 -type f -ls || true",
+            "  fi",
+            "else",
+            "  echo \"⚠️ No installer directory found after unzip (INSTALLER_DIR empty)\"",
+            "  echo \"Debug: Full contents of /tmp/__JIRA__/utilities/syntax-ct:\"",
+            "  ls -la /tmp/__JIRA__/utilities/syntax-ct/ || true",
+            "fi",
+            "",
+            "# show parent dir",
+            "echo \"📁 /tmp/__JIRA__/utilities/syntax-ct contents:\"",
+            "ls -la /tmp/__JIRA__/utilities/syntax-ct || echo \"⚠️ Could not list /tmp/__JIRA__/utilities/syntax-ct\"",
+            "",
+            "# copy helper scripts from S3 (log each stdout/stderr)",
+            "echo \"ACTION: copy helper scripts from __S3_SCRIPT_BASE__ to /tmp/__JIRA__/scripts/\"",
+            "/usr/local/bin/aws s3 cp __S3_SCRIPT_BASE__/backup-syntaxctexport.sh /tmp/__JIRA__/scripts/ --region __REGION__ > /tmp/ssm_cp_backup_stdout 2> /tmp/ssm_cp_backup_stderr || true; echo \"EXITCODE_CP_BACKUP: $?\"",
+            "echo \"--- backup cp stdout ---\"; cat /tmp/ssm_cp_backup_stdout || true",
+            "echo \"--- backup cp stderr ---\"; cat /tmp/ssm_cp_backup_stderr || true",
+            "/usr/local/bin/aws s3 cp __S3_SCRIPT_BASE__/deploy-syntaxctimport.sh /tmp/__JIRA__/scripts/ --region __REGION__ > /tmp/ssm_cp_import_stdout 2> /tmp/ssm_cp_import_stderr || true; echo \"EXITCODE_CP_IMPORT: $?\"",
+            "echo \"--- import cp stdout ---\"; cat /tmp/ssm_cp_import_stdout || true",
+            "echo \"--- import cp stderr ---\"; cat /tmp/ssm_cp_import_stderr || true",
+            "",
+            "chmod +x /tmp/__JIRA__/scripts/backup-syntaxctexport.sh || true",
+            "chmod +x /tmp/__JIRA__/scripts/deploy-syntaxctimport.sh || true",
+            "",
+            "echo \"📁 /tmp/__JIRA__/scripts contents:\"",
+            "ls -la /tmp/__JIRA__/scripts || echo \"⚠️ Could not list /tmp/__JIRA__/scripts\"",
+            "",
+            "echo \"SSM_END_MARKER: SYNTAX_CT_COPY_COMPLETE\""
+          ]
+        }
+        JSON
+
+            # Replace placeholders in the commands_syntaxct.json
+            sed -i "s|__JIRA__|${JIRA_ID}|g" commands_syntaxct.json
+            sed -i "s|__S3_UTIL_BASE__|${S3_UTIL_BASE}|g" commands_syntaxct.json
+            sed -i "s|__S3_SCRIPT_BASE__|${S3_SCRIPT_BASE}|g" commands_syntaxct.json
+            sed -i "s|__REGION__|${REGION}|g" commands_syntaxct.json
+            sed -i "s|__VERSION__|${VERSION}|g" commands_syntaxct.json
+
+            # Debug print of payload
+            echo "---- commands_syntaxct.json ----"
+            cat commands_syntaxct.json
+            echo "------------------------------"
+
+            # Send SSM command
+            CMD_ID=$(aws ssm send-command \
+              --document-name "AWS-RunShellScript" \
+              --instance-ids "$CLEAN_IID" \
+              --comment "Copy SYNTAX-CT utilities & helper scripts for $COMP" \
+              --parameters file://commands_syntaxct.json \
+              --region "$REGION" \
+              --query 'Command.CommandId' --output text)
+
+            echo "🆔 CommandId SYNTAX-CT ($COMP/$CLEAN_IID): $CMD_ID"
+            if [[ -z "$CMD_ID" || "$CMD_ID" = "None" ]]; then
+              echo "❌ send-command failed for SYNTAX-CT $COMP/$CLEAN_IID"
+              FAIL_LIST+=("SYNTAX-CT:$COMP:$CLEAN_IID:SSM_SEND")
+              continue
+            fi
+
+            # wait for execution
+            if ! aws ssm wait command-executed --command-id "$CMD_ID" --instance-id "$CLEAN_IID" --region "$REGION"; then
+              INV=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$CLEAN_IID" --region "$REGION" --output json || true)
+              echo "❌ SSM wait failed for SYNTAX-CT $COMP/$CLEAN_IID"
+              echo "---- full invocation JSON ----"
+              echo "$INV" | jq '.' || true
+              FAIL_LIST+=("SYNTAX-CT:$COMP:$CLEAN_IID:SSM_WAIT_FAILED")
+              continue
+            fi
+
+            # fetch invocation result
+            RES=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$CLEAN_IID" --region "$REGION" --output json || true)
+            ST=$(echo "$RES" | jq -r '.Status // ""')
+            SE=$(echo "$RES" | jq -r '.StandardErrorContent // ""')
+            SO=$(echo "$RES" | jq -r '.StandardOutputContent // ""')
+
+            # Print summary
+            echo "---- SSM Invocation SUMMARY for $COMP/$CLEAN_IID ----"
+            echo "$RES" | jq '{Status,StatusDetails,TimedOut:.TimedOut,DocumentName:.DocumentName}' || true
+
+            # Combine both stdout and stderr for analysis since markers are in stderr
+            COMBINED_OUTPUT="$SO"$'\n'"$SE"
+
+            echo "---- BEGIN COMBINED OUTPUT (key sections) ----"
+            echo "$COMBINED_OUTPUT" | grep -E "SSM_START_MARKER|✅|❌|⚠️|Found installer|INSTALLER_DIR_VAR|Execute permissions|SSM_END_MARKER|backup-syntaxctexport|deploy-syntaxctimport|/tmp/.*scripts contents" | head -50
+            echo "---- END COMBINED OUTPUT ----"
+
+            # Quick markers check
+            if echo "$COMBINED_OUTPUT" | grep -q "SSM_START_MARKER"; then
+              echo "INFO: SSM payload started on instance (marker found)"
+            else
+              echo "WARN: SSM start marker NOT found in output"
+            fi
+
+            # Determine success using explicit markers from both stdout and stderr
+            if echo "$COMBINED_OUTPUT" | grep -qiE "Found installer:|✅ installer.zip downloaded|✅ installer.zip copied|✅ Execute permissions set|✅ installer file is present and executable|SSM_END_MARKER: SYNTAX_CT_COPY_COMPLETE"; then
+              echo "✅ SYNTAX-CT utilities prepared for $COMP on $CLEAN_IID (identified success markers in output)"
+              SUCCESS_LIST+=("SYNTAX-CT:$COMP:$CLEAN_IID:INSTALLER_COPIED")
+            else
+              # Check for obvious errors
+              if echo "$COMBINED_OUTPUT" | grep -qiE 'AccessDenied|Forbidden|NoSuchKey|Permission denied|No such file|error|ERROR'; then
+                REASON=$(echo "$COMBINED_OUTPUT" | grep -E 'AccessDenied|Forbidden|NoSuchKey|Permission denied|No such file|error|ERROR' | head -1 | tr '\n' ' ')
+                echo "❌ SYNTAX-CT error for $COMP/$CLEAN_IID: $REASON"
+                FAIL_LIST+=("SYNTAX-CT:$COMP:$CLEAN_IID:ERROR:${REASON}")
+                continue
+              fi
+
+              if echo "$COMBINED_OUTPUT" | grep -qiE '❌|WARN:|No installer found|missing after'; then
+                echo "⚠️ SYNTAX-CT reported problems for $COMP/$CLEAN_IID"
+                if echo "$COMBINED_OUTPUT" | grep -qi '📁 /tmp/.*scripts contents:'; then
+                  echo "⚠️ SYNTAX-CT helper scripts present but installer missing"
+                  SUCCESS_LIST+=("SYNTAX-CT:$COMP:$CLEAN_IID:HELPER_ONLY")
+                else
+                  echo "❌ SYNTAX-CT utilities missing and no clear helper success"
+                  FAIL_LIST+=("SYNTAX-CT:$COMP:$CLEAN_IID:INSTALLER_MISSING")
+                fi
+              else
+                echo "⚠️ SYNTAX-CT: no explicit success or failure markers detected."
+                # Check if we can see any positive indicators
+                if echo "$COMBINED_OUTPUT" | grep -qi '📁 /tmp/.*scripts contents:'; then
+                  echo "⚠️ SYNTAX-CT helper scripts present but overall status unclear"
+                  SUCCESS_LIST+=("SYNTAX-CT:$COMP:$CLEAN_IID:HELPER_ONLY")
+                else
+                  echo "❌ SYNTAX-CT no clear success indicators found"
+                  FAIL_LIST+=("SYNTAX-CT:$COMP:$CLEAN_IID:UNCLEAR")
+                fi
+              fi
+            fi
+
+          done < syntaxct_map.txt
+
+          echo "✅ SYNTAX-CT copy complete for all mapped components"
+        else
+          echo "ℹ️ No syntaxct_map.txt found - skipping SYNTAX-CT utilities copy"
+        fi
+
+        echo "✅ All component copies complete."
+        # ============================================
+        # Final summary for the end user (success / failed items)
+        # ============================================
+      
+        echo
+        echo "========================"
+        echo "📋 SUMMARY - Copy Operations"
+        echo "========================"
+        if [ "${#SUCCESS_LIST[@]}" -gt 0 ]; then
+          echo "✅ Completed:"
+          for I in "${SUCCESS_LIST[@]}"; do
+            echo "  - $I"
+          done
+        else
+          echo "No successful items recorded"
+        fi
+
+        echo
+
+        if [ "${#FAIL_LIST[@]}" -gt 0 ]; then
+          echo "❌ Failed / Skipped:"
+          for I in "${FAIL_LIST[@]}"; do
+            echo "  - $I"
+          done
+          # fail the build so user sees failure if any critical step failed
+          echo
+          echo "One or more steps failed — please check errors above for details."
+          exit 1
+        else
+          echo "🎉 No failures recorded"
+        fi
+
+  post_build:
+    commands:
+      - |
+        echo "Resetting AWS credentials to CodeBuild role..."
+
+        unset AWS_ACCESS_KEY_ID
+        unset AWS_SECRET_ACCESS_KEY
+        unset AWS_SESSION_TOKEN
+
+        exec > >(stdbuf -oL tee -a /tmp/build.log) 2>&1
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [POST_BUILD] UPLOADING_LOGS"
+        S3_PATH="s3://nonprod-release-management-codebuild-logs/pipeline-logs/$PIPELINE_EXECUTION_ID/$STAGE_NAME/build.log"
+        aws s3 cp /tmp/build.log "$S3_PATH"
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [POST_BUILD] LOGS_UPLOADED_TO=$S3_PATH"
+
+artifacts:
+  files:
+    - '**/*'

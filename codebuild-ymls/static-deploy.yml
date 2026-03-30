@@ -1,0 +1,237 @@
+version: 0.2
+
+env:
+  variables:
+    STATIC_SSM_TIMEOUT_SECS: "3600"
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.11
+    commands:
+      - echo "📦 Installing dependencies..."
+      - yum install -y jq awscli
+      - echo "✅ Install complete"
+
+  build:
+    commands:
+      - |
+        exec > >(stdbuf -oL tee -a /tmp/build.log) 2>&1
+        echo STAGE_NAME=$STAGE_NAME
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [BUILD]📥 Reading task.json from SSM using JIRA_ID=$JIRA_ID"
+        TASK_PARAM_PATH="/rm-flow-controller/${JIRA_ID}/task.json"
+      
+        echo "🔎 SSM path: $TASK_PARAM_PATH"
+      
+        TASK_JSON="$(aws ssm get-parameter \
+          --name "$TASK_PARAM_PATH" \
+          --with-decryption \
+          --query 'Parameter.Value' \
+          --output text \
+          --region eu-west-1)" || true
+        if [[ -z "$TASK_JSON" || "$TASK_JSON" == "None" ]]; then
+          echo "❌ Empty SSM value for $TASK_PARAM_PATH"; exit 1
+        fi
+        printf '%s\n' "$TASK_JSON" > task.json
+        echo "✅ Saved to task.json"; jq . task.json || cat task.json
+
+        # 2️⃣ Extract metadata & assume role
+      
+        echo "📌 Extracting metadata..."
+        CLIENT=$(jq -r '.client' task.json)
+        ENV=$(jq -r '.env' task.json)
+        JIRA=$(jq -r '.jira_ticket' task.json)
+        echo "✅ Fields: CLIENT=${CLIENT} ENV=${ENV} JIRA=${JIRA} TASK_INDEX=${TASK_INDEX:-<unset>} TIMEOUT=${STATIC_SSM_TIMEOUT_SECS}s"
+
+        echo "📥 Fetching Parameter Store metadata..."
+        PARAM_PATH="/arm-cpr/$CLIENT/$ENV/details.json"
+        PARAM_JSON=$(aws ssm get-parameter --name "$PARAM_PATH" --with-decryption --query 'Parameter.Value' --output text)
+        echo "$PARAM_JSON" | jq . >/dev/null
+        echo "✅ Parameter JSON fetched"
+
+        REGION=$(echo "$PARAM_JSON" | jq -r '.region')
+        ROLE_ARN=$(echo "$PARAM_JSON" | jq -r '.assume_role_arn')
+        S3_PATH=$(echo "$PARAM_JSON" | jq -r '.backup_s3_details.bucket_name')
+        ORACLE_HOST=$(echo "$PARAM_JSON" | jq -r '.database_details.oracle_host')
+        ORACLE_PORT=$(echo "$PARAM_JSON" | jq -r '.database_details.oracle_port')
+        ORACLE_SID=$(echo "$PARAM_JSON" | jq -r '.database_details.oracle_sid')
+        DB_USER=$(echo "$PARAM_JSON" | jq -r '.database_details.oracle_user')
+        DB_PASS=$(echo "$PARAM_JSON" | jq -r '.database_details.oracle_password')
+        STATIC_DIR=$(echo "$PARAM_JSON" | jq -r '.static_details.static_dir')
+        ORACLE_HOME=$(echo "$PARAM_JSON" | jq -r '.static_details.oracle_home')
+        LIBRARY_PATH=$(echo "$PARAM_JSON" | jq -r '.static_details.library_path')
+        # DB_URL="jdbc:oracle:thin:@${ORACLE_HOST}:${ORACLE_PORT}:${ORACLE_SID}"
+
+        if [[ -z "$REGION" || "$REGION" == "null" || -z "$ROLE_ARN" || "$ROLE_ARN" == "null" ]]; then
+          echo "❌ region/assume_role_arn missing in Parameter Store"; exit 1
+        fi
+        echo "✅ REGION=$REGION and ROLE_ARN present"
+
+        CREDS=$(aws sts assume-role \
+          --role-arn "$ROLE_ARN" \
+          --role-session-name StaticDeploySession \
+          --region "$REGION")
+
+        export AWS_ACCESS_KEY_ID=$(echo $CREDS | jq -r .Credentials.AccessKeyId)
+        export AWS_SECRET_ACCESS_KEY=$(echo $CREDS | jq -r .Credentials.SecretAccessKey)
+        export AWS_SESSION_TOKEN=$(echo $CREDS | jq -r .Credentials.SessionToken)
+        echo "✅ Role assumed successfully"
+
+        # 3️⃣ Deployment logic
+      
+        echo "================================="
+        echo "🛠 Starting Static deployment process"
+
+        SUCCESS_LIST=""
+        FAILURE_LIST=""
+
+        TASK_INDEX=${TASK_INDEX:-0}
+        TASK_COUNT=$(jq '.deploy | length' task.json)
+
+        if [[ "$TASK_INDEX" -ge "$TASK_COUNT" || "$TASK_INDEX" -lt 0 ]]; then
+          echo "❌ Invalid TASK_INDEX, must be between 0 and $(($TASK_COUNT - 1))"
+          exit 1
+        fi
+
+        UNFORMATTED_TASK_TYPE=$(jq -r ".deploy[$TASK_INDEX].task_type" task.json)
+        TASK_TYPE=$(echo "$UNFORMATTED_TASK_TYPE" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z]//g')
+
+        if [[ "$TASK_TYPE" =~ ^static ]]; then
+          SERVER=$(jq -r ".deploy[$TASK_INDEX].server // empty" task.json)
+          STATIC_CFG_FILE=$(jq -r ".deploy[$TASK_INDEX].package_cfg" task.json)
+          STATIC_CSV_FILE=$(jq -r ".deploy[$TASK_INDEX].package_csv" task.json)
+        #   LOG_FILE=$(jq -r ".deploy[$TASK_INDEX].log_file" task.json)
+          TASK_IDENTIFIER="$UNFORMATTED_TASK_TYPE"
+
+          if [[ -n "$SERVER" ]]; then
+            echo "🔍 Looking up instance ID for server '$SERVER'..."
+            INSTANCE_ID=$(echo "$PARAM_JSON" | jq -r ".Instance_mappings.\"${SERVER}_instance_id\" // empty")
+            if [[ -n "$INSTANCE_ID" ]]; then
+              echo "✅ Using instance ID from server mapping: $INSTANCE_ID"
+            fi
+          fi
+
+          if [[ -z "$INSTANCE_ID" || "$INSTANCE_ID" == "null" ]]; then
+            echo "⚙️ Server not provided or mapping not found, using task-type mapping for '$TASK_TYPE'"
+            INSTANCE_ID=$(echo "$PARAM_JSON" | jq -r ".task_type_mappings.\"${TASK_TYPE}_instance_id\" // empty")
+          fi
+
+          if [[ -z "$INSTANCE_ID" || "$INSTANCE_ID" == "null" ]]; then
+            echo "❌ No instance ID found for server '${SERVER:-none}' or task_type '${TASK_TYPE}'. Skipping."
+            FAILURE_LIST+="Static → ${SERVER:-unknown} (missing instance id)"$'\n'
+            continue
+          fi
+
+          echo "📦 Running Static deploy script on EC2 instance: $INSTANCE_ID"
+
+          COMMAND_ID=$(aws ssm send-command \
+            --document-name "AWS-RunShellScript" \
+            --instance-ids "$INSTANCE_ID" \
+            --region "$REGION" \
+            --comment "Executing Static deploy script" \
+            --parameters "commands=[
+              \"chmod +x /tmp/${JIRA}/scripts/deploy-static.sh\",
+              \"/tmp/${JIRA}/scripts/deploy-static.sh $JIRA $STATIC_CFG_FILE $STATIC_CSV_FILE $S3_PATH $ORACLE_HOST $ORACLE_SID $STATIC_DIR $ORACLE_HOME $LIBRARY_PATH $TASK_IDENTIFIER\"
+            ]" \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "Command ID: $COMMAND_ID. Waiting for completion..."
+
+          # Wait and capture the command output (logs)
+          while true; do
+            COMMAND_STATUS=$(aws ssm list-command-invocations \
+              --command-id "$COMMAND_ID" \
+              --region "$REGION" \
+              --query "CommandInvocations[].Status" \
+              --output text)
+
+            echo "Command status: $COMMAND_STATUS"
+
+            if [[ "$COMMAND_STATUS" == "Success" ]]; then
+              # Capture the output and error logs
+              SSM_OUTPUT=$(aws ssm get-command-invocation \
+                --command-id "$COMMAND_ID" \
+                --instance-id "$INSTANCE_ID" \
+                --region "$REGION" \
+                --query "StandardOutputContent" \
+                --output text)
+
+              echo "✅ Command executed successfully!"
+              echo "🎯 Command Output:"
+              echo "$SSM_OUTPUT"
+
+              SUCCESS_LIST="${SUCCESS_LIST}\n$SERVER:$STATIC_CFG_FILE"
+              break
+
+            elif [[ "$COMMAND_STATUS" == "Failed" || "$COMMAND_STATUS" == "TimedOut" || "$COMMAND_STATUS" == "Cancelled" ]]; then
+              # Capture and display output logs
+              SSM_OUTPUT=$(aws ssm get-command-invocation \
+                --command-id "$COMMAND_ID" \
+                --instance-id "$INSTANCE_ID" \
+                --region "$REGION" \
+                --query "StandardOutputContent" \
+                --output text)
+
+              echo "🎯 Command Output:"
+              echo "$SSM_OUTPUT"              
+              
+              # Capture and display error logs
+              SSM_ERROR=$(aws ssm get-command-invocation \
+                --command-id "$COMMAND_ID" \
+                --instance-id "$INSTANCE_ID" \
+                --region "$REGION" \
+                --query "StandardErrorContent" \
+                --output text)
+
+              echo "❌ Command failed with status: $COMMAND_STATUS"
+              echo "🎯 Command Error Logs:"
+              echo "$SSM_ERROR"
+
+              FAILURE_LIST="${FAILURE_LIST}\n$SERVER:$STATIC_CFG_FILE (Status: $COMMAND_STATUS)"
+              break
+
+            elif [[ "$COMMAND_STATUS" == "Pending" || "$COMMAND_STATUS" == "InProgress" ]]; then
+              echo "Command in progress. Waiting..."
+              sleep 10
+
+            else
+              FAILURE_LIST="${FAILURE_LIST}\n$SERVER:$STATIC_CFG_FILE (Unexpected Status)"
+              break
+            fi
+          done
+        fi
+
+        echo "================================="
+        echo "🎯 Deployment Summary"
+        echo "✅ Successful Deployments:"
+        echo -e "${SUCCESS_LIST:-<none>}"
+        echo "❌ Failed Deployments:"
+        echo -e "${FAILURE_LIST:-<none>}"
+
+        if [[ -n "${FAILURE_LIST// }" ]]; then
+          exit 1
+        fi
+
+  post_build:
+    commands:
+      - |
+        echo "Resetting AWS credentials to CodeBuild role..."
+
+        unset AWS_ACCESS_KEY_ID
+        unset AWS_SECRET_ACCESS_KEY
+        unset AWS_SESSION_TOKEN
+        
+        exec > >(stdbuf -oL tee -a /tmp/build.log) 2>&1
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [POST_BUILD] UPLOADING_LOGS"
+
+        # Use parent execution ID if passed, otherwise use own
+        EXEC_FOLDER="${PARENT_EXECUTION_ID:-$PIPELINE_EXECUTION_ID}"
+
+        S3_PATH="s3://nonprod-release-management-codebuild-logs/pipeline-logs/$EXEC_FOLDER/$STAGE_NAME/build.log"
+        aws s3 cp /tmp/build.log "$S3_PATH"
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [POST_BUILD] LOGS_UPLOADED_TO=$S3_PATH"
+
+artifacts:
+  files:
+    - '**/*'

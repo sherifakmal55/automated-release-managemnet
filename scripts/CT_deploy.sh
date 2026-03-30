@@ -1,0 +1,111 @@
+#!/bin/bash
+
+set -euo pipefail
+
+# Inputs
+JIRA_TICKET="$1"
+CTE_FILE="$2"              # Input .cte file to be imported
+S3_PATH="$3"
+DB_URL="$4"                # Database URL (e.g., jdbc:oracle:thin:@...)
+DB_USER="$5"               # Database username
+DB_PASS="$6"               # Database password
+TASK_IDENTIFIER="$7"       # e.g., CTTask1 or CTTask2
+
+TASK_TYPE="ConfigurationTransfer"
+TASK_ID="${TASK_IDENTIFIER}"
+
+# Prepare working directory for deployment executions logs
+WORK_DIR="/tmp/Release-Management/${JIRA_TICKET}/deploy/${TASK_TYPE}/${TASK_ID}"
+mkdir -p "$WORK_DIR"
+
+# Paths
+CTC_DIR="/tmp/Release-Management/${JIRA_TICKET}/utilities/${TASK_TYPE}"
+CTC_BINARY="${CTC_DIR}/CTC"
+CTE_PATH="/tmp/Release-Management/${JIRA_TICKET}/client_packages/deploy/${CTE_FILE}"  # <-- Updated
+CTC_LOG_FILE="${CTC_DIR}/ConfigurationTransfer.log"  # <-- Updated
+
+# Timestamp for unique log files
+TIMESTAMP=$(date +%Y%m%d%H%M%S)
+DEPLOY_LOG_FILE="${WORK_DIR}/config_transfer_deploy_${TASK_ID}_${TIMESTAMP}.log"
+
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$DEPLOY_LOG_FILE"
+}
+
+cd "$WORK_DIR"
+
+log "=== Starting Configuration Transfer deployment for task $TASK_ID ==="
+log "CTE file: $CTE_PATH"
+log "CTC binary: $CTC_BINARY"
+log "Working dir: $WORK_DIR"
+
+# Check if CTC binary exists
+if [[ ! -f "$CTC_BINARY" ]]; then
+    log "ERROR: CTC binary not found at: $CTC_BINARY"
+    exit 1
+fi
+
+# Check if CTE file exists
+if [[ ! -f "$CTE_PATH" ]]; then
+    log "ERROR: CTE file not found at: $CTE_PATH"
+    exit 1
+fi
+
+# Set up Java environment
+log "Setting up Java environment for CTC deployment..."
+
+export JAVA_HOME="/STL/Java/jdk-17.0.7"
+export PATH="$JAVA_HOME/bin:$PATH"
+
+if ! command -v java &> /dev/null; then
+    log "ERROR: Java not found even after setting JAVA_HOME"
+    exit 1
+fi
+
+log "Java found at: $(which java)"
+log "Java version: $(java -version 2>&1 | head -n 1)"
+
+# Change to CTC directory and run import
+cd "$CTC_DIR"
+log "Executing CTC import..."
+
+if ./CTC \
+    -d"$DB_URL" \
+    -u"$DB_USER" \
+    -w"$DB_PASS" \
+    -aimport \
+    -i"$CTE_PATH"; then
+    log "CTC import completed successfully for $TASK_ID."
+else
+    log "ERROR: CTC import failed for $TASK_ID."
+    exit 1
+fi
+
+# Upload CTC log file (Configurationtransfer.log) to S3
+S3_CTC_LOG_PATH="${S3_PATH}/${JIRA_TICKET}/${TASK_TYPE}/${TASK_ID}/Configurationtransfer_${TIMESTAMP}.log"
+log "Uploading Configurationtransfer.log to S3: $S3_CTC_LOG_PATH"
+
+if [[ -f "$CTC_LOG_FILE" ]]; then
+    if aws s3 cp "$CTC_LOG_FILE" "$S3_CTC_LOG_PATH"; then
+        log "S3 upload successful for Configurationtransfer.log"
+    else
+        log "ERROR: Failed to upload Configurationtransfer.log to S3"
+        exit 1
+    fi
+else
+    log "ERROR: Configurationtransfer.log not found at $CTC_LOG_FILE"
+    exit 1
+fi
+
+# Upload deploy log file (this script's log) to S3
+S3_DEPLOY_LOG_PATH="${S3_PATH}/${JIRA_TICKET}/${TASK_TYPE}/${TASK_ID}/deploy_wrapper_${TASK_ID}_${TIMESTAMP}.log"
+log "Uploading deploy log to S3: $S3_DEPLOY_LOG_PATH"
+
+if aws s3 cp "$DEPLOY_LOG_FILE" "$S3_DEPLOY_LOG_PATH"; then
+    log "S3 upload successful for deploy wrapper log."
+else
+    log "ERROR: Failed to upload deploy wrapper log to S3."
+    exit 1
+fi
+
+log "=== Configuration Transfer deployment for task $TASK_ID completed successfully ==="

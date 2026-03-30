@@ -1,0 +1,281 @@
+version: 0.2
+
+env:
+  variables:
+    REGION: "eu-west-1"
+    STATE_BUCKET: "rm-flow-controller-artifacts"
+  exported-variables:
+    - NEED_APPROVAL
+    - JIRA_ID
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.11
+    commands:
+      - yum install -y jq awscli
+      - yum install -y coreutils || true
+      - |
+        exec > >(stdbuf -oL tee -a /tmp/build.log) 2>&1
+
+  build:
+    commands:
+      - |
+        exec > >(stdbuf -oL tee -a /tmp/build.log) 2>&1
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [BUILD] 📥 Reading task.json..."
+        echo "---- CODEBUILD_SRC_DIR* env vars ----"
+        env | grep '^CODEBUILD_SRC_DIR' || true
+        echo "---- current dir ----"
+        pwd
+        ls -la || true
+
+        # try common env var names and common internal layouts (flattened vs preserved folder)
+      
+        set -o pipefail
+        FOUND=0
+        # candidate env var names in order of preference
+        CANDS=("CODEBUILD_SRC_DIR_VALIDATEDOUTPUT" "CODEBUILD_SRC_DIR_VALIDATED_OUTPUT" "CODEBUILD_SRC_DIR_ValidatedOutput" "CODEBUILD_SRC_DIR")
+        for V in "${CANDS[@]}"; do
+          DIR=$(eval "echo \"\${${V}:-}\"")
+          if [ -n "$DIR" ] && [ -d "$DIR" ]; then
+            echo "Checking \$${V} -> $DIR"
+            # check common placements
+            for P in "$DIR/task.json" "$DIR/ValidatedOutput/task.json" "$DIR/validatedOutput/task.json"; do
+              if [ -f "$P" ]; then
+                echo "Found task.json at: $P (via \$${V})"
+                cp -- "$P" ./task.json
+                FOUND=1
+                break 2
+              fi
+            done
+          else
+            echo "Not present or empty: \$${V} -> [$DIR]"
+          fi
+        done
+        if [ $FOUND -eq 0 ]; then
+          echo "ERROR: task.json not found. Possible causes:"
+          echo "- Stage-1 did not run in this pipeline execution (manual re-run of Stage-4 will not have artifacts)."
+          echo "- Artifact name mismatch (ensure Stage-1 output artifact name EXACTLY = 'ValidatedOutput')."
+          echo "- discard-paths: yes in Stage-1 flattened the artifact (task.json will be at artifact root)."
+          echo "List of CODEBUILD_SRC_DIR_* directories (for inspection):"
+          env | awk -F= '/^CODEBUILD_SRC_DIR/ {print $1}' | while read -r v; do d=$(eval "echo \"\${$v:-}\""); echo \"---- $v -> [$d] ----\"; ls -la \"$d\" || true; done
+          exit 1
+        fi
+        echo "---- task.json ----"
+        cat task.json || true
+
+        # 2) Override JIRA_ID from JSON if present
+        JIRA_FROM_JSON=$(jq -r '.jira_ticket // empty' task.json)
+      
+        if [ -n "$JIRA_FROM_JSON" ] && [ "$JIRA_FROM_JSON" != "null" ]; then
+          echo "🆔 Overriding JIRA_ID from JSON: $JIRA_ID → $JIRA_FROM_JSON"
+          JIRA_ID="$JIRA_FROM_JSON"
+        else
+          echo "⚠️ No jira_ticket in JSON; keeping env JIRA_ID=$JIRA_ID"
+        fi
+
+        # 3) Count deploy[] and show types
+        echo "🧮 Counting deploy items…"
+        DEPLOY_COUNT=$(jq '.deploy | length' task.json 2>/dev/null || echo 0)
+        echo "DEPLOY_COUNT=$DEPLOY_COUNT"
+        echo "📋 task_types found:"; jq -r '.deploy[].task_type' task.json || true
+
+        # small debug: list indices that are airflow tasks (helpful to verify resume behavior)
+      
+        AIRFLOW_INDICES=$(jq -r 'to_entries[] | select(.value.task_type | test("^airflow"; "i")) | .key' task.json 2>/dev/null | tr '\n' ',' | sed 's/,$//')
+        if [ -z "$AIRFLOW_INDICES" ]; then AIRFLOW_INDICES="<none>"; fi
+        echo "🪧 Airflow deploy indices: ${AIRFLOW_INDICES}"
+
+        # 4) Read Controller-1 state from S3
+        STATE_KEY="s3://${STATE_BUCKET}/state/${JIRA_ID}.json"
+      
+        echo "📥 Reading Controller-1 state: ${STATE_KEY}"
+       
+        if ! aws s3 cp "${STATE_KEY}" state.json >/dev/null 2>&1; then
+          echo "❌ Missing state file at ${STATE_KEY}. Cannot resume."; exit 1
+        fi
+        cat state.json
+
+        STATE_STATUS=$(jq -r '.status // empty' state.json)
+        FAILED_INDEX=$(jq -r '.index // -1' state.json)
+        FAILED_PIPELINE=$(jq -r '.failed_pipeline // ""' state.json)
+      
+        echo "🧭 State: status=${STATE_STATUS} failed_index=${FAILED_INDEX} failed_pipeline='${FAILED_PIPELINE}'"
+
+        # 5) Decide starting index based on state (NO early exits; set flags instead)
+      
+        set -euo pipefail
+        export NEED_APPROVAL="true"      # default until proven otherwise
+        export RESUME="no"               # default: don't resume unless we decide to
+        export START_INDEX=""
+
+        if [ "${DEPLOY_COUNT}" -eq 0 ]; then
+          echo "⚠️ No deploy[] items; nothing to resume."
+          export NEED_APPROVAL="false"
+        else
+          case "${STATE_STATUS}" in
+            OK)
+              echo "✅ Controller-1 ended OK; nothing to resume in Controller-2."
+              export NEED_APPROVAL="false"
+              ;;
+            NEEDS_APPROVAL)
+              if [ "${FAILED_INDEX}" -lt 0 ]; then
+                echo "ℹ️ NEEDS_APPROVAL but no failed index recorded; assuming nothing to resume."
+                export NEED_APPROVAL="false"
+              else
+                START_INDEX=$((FAILED_INDEX + 1))
+                if [ "${START_INDEX}" -ge "${DEPLOY_COUNT}" ]; then
+                  echo "ℹ️ Failed index ${FAILED_INDEX} is the last (0-based). Nothing to resume (start=${START_INDEX} ≥ deploy_count=${DEPLOY_COUNT})."
+                  export NEED_APPROVAL="false"
+                else
+                  echo "➡️ Will resume from index=${START_INDEX} (0-based)"
+                  export RESUME="yes"
+                  export START_INDEX
+                fi
+              fi
+              ;;
+            *)
+              echo "⚠️ Unknown state.status='${STATE_STATUS}'. Treating as nothing to resume."
+              export NEED_APPROVAL="false"
+              ;;
+          esac
+        fi
+
+        # 6) Iterate remaining deploy[] items ONLY if RESUME=yes
+      
+        set -euo pipefail
+        if [ "${RESUME}" != "yes" ]; then
+          echo "ℹ️ Resume loop skipped (RESUME=${RESUME})."
+        else
+          i=${START_INDEX}
+          while [ "${i}" -lt "${DEPLOY_COUNT}" ]; do
+            TASK_TYPE=$(jq -r ".deploy[$i].task_type" task.json)
+            case "$TASK_TYPE" in
+            DatabaseSql*) PIPELINE_NAME="RM-GN-NON-PROD-Sql-Pipeline" ;;
+            WarDeployment1|WarDeployment2|WARDeployment*|WARDeployments) PIPELINE_NAME="RM-GN-NON-PROD-War-Pipeline" ;;
+            LinuxPackages1|LinuxPackages2|LinuxPackages3|LinuxPackages*|LinuxPackages|LinuxPackage) PIPELINE_NAME="RM-GN-NON-PROD-Linux-Pipeline" ;;
+            ConfigurationTransfer1|ConfigurationTransfer2|ConfigurationTransfer3|ConfigurationTransfer*|ConfigurationTransfers) PIPELINE_NAME="RM-GN-NON-PROD-CT-Pipeline" ;;
+            TLMView1|TLMView2|TLMView|TLMView*|TLMViews) PIPELINE_NAME="RM-GN-NON-PROD-TLMView-Pipeline" ;;
+            Static1|Static2|Static3|Static4|Static*|Static|Statics) PIPELINE_NAME="RM-GN-NON-PROD-Static-Pipeline" ;;
+            Control1|Control2|Control*|Controls) PIPELINE_NAME="RM-GN-NON-PROD-Control-Pipeline" ;;
+            Syntax-CT1|Syntax-CT2|Syntax-CT*|Syntax-CTs) PIPELINE_NAME="RM-GN-NON-PROD-SyntaxCT-Pipeline" ;;
+            # --- AIRFLOW: match airflow1, airflow2, Airflow, air-flow, etc. ---
+            airflow*|Airflow*|AIRFLOW*|air-flow*) PIPELINE_NAME="RM-GN-NON-PROD-Airflow-Gitpull-Pipeline" ;;
+            *) PIPELINE_NAME="" ;;
+          esac
+
+            echo "➡️ index=$i task_type=$TASK_TYPE → pipeline='${PIPELINE_NAME}'"
+
+            if [ -z "$PIPELINE_NAME" ]; then
+              echo "❌ ERROR: Unmapped task_type=$TASK_TYPE at index=$i"
+              FAILURE="yes"; FAILED_PIPELINE="(unmapped:${TASK_TYPE})"; FAILED_INDEX=$i; break
+            fi
+
+            # Per-pipeline variables (match TASK_TYPE)
+            # Include Airflow in the indexed set so the Airflow pipeline receives TASK_INDEX and TASK_TYPE
+            if echo "$TASK_TYPE" | grep -Ei '^(DatabaseSql*|WarDeployment|WarDeployment1|WarDeployment2|WARDeployment*|WARDeployments|ConfigurationTransfer1|ConfigurationTransfer2|ConfigurationTransfer*|ConfigurationTransfers|TLMView1|TLMView2|TLMView*|TLMView|TLMViews|Static1|Static2|Static3|Static4|Static*|Static|Statics|LinuxPackages1|LinuxPackages2|LinuxPackages3|LinuxPackages*|LinuxPackages|Control1|Control2|Control*|Controls|Syntax-CT1|Syntax-CT2|Syntax-CT*|Syntax-CTs|airflow|air-flow|Airflow)' >/dev/null; then
+              VARS="name=JIRA_ID,value=${JIRA_ID} name=TASK_INDEX,value=${i} name=TASK_TYPE,value=${TASK_TYPE} name=PARENT_EXECUTION_ID,value=${PIPELINE_EXECUTION_ID}"
+            else
+              VARS="name=JIRA_ID,value=${JIRA_ID} name=PARENT_EXECUTION_ID,value=${PIPELINE_EXECUTION_ID}"
+            fi
+            
+
+            echo "🚀 Starting ${PIPELINE_NAME} with vars: $VARS"
+            EXEC_ID=$(aws codepipeline start-pipeline-execution \
+              --name "${PIPELINE_NAME}" \
+              --region "${REGION}" \
+              --variables $VARS \
+              --query 'pipelineExecutionId' --output text)
+
+            if [ -z "$EXEC_ID" ] || [ "$EXEC_ID" = "None" ]; then
+              echo "❌ ERROR: Failed to start ${PIPELINE_NAME}"
+              FAILURE="yes"; FAILED_PIPELINE="${PIPELINE_NAME}"; FAILED_INDEX=$i; break
+            fi
+
+            echo "🔗 Live logs: https://${REGION}.console.aws.amazon.com/codesuite/codepipeline/pipelines/${PIPELINE_NAME}/view/execution/${EXEC_ID}?region=${REGION}"
+
+            STATUS="InProgress"; HEART=0
+            while : ; do
+              STATUS=$(aws codepipeline get-pipeline-execution \
+                --pipeline-name "${PIPELINE_NAME}" \
+                --pipeline-execution-id "${EXEC_ID}" \
+                --region "${REGION}" \
+                --query 'pipelineExecution.status' --output text 2>/dev/null || echo "Unknown")
+
+              echo " … ${PIPELINE_NAME} status: $STATUS"
+              HEART=$((HEART+1)); if [ $HEART -ge 6 ]; then echo " ⏰ still waiting on ${PIPELINE_NAME} (exec ${EXEC_ID})"; HEART=0; fi
+
+              case "$STATUS" in
+                Succeeded|Failed|Superseded|Cancelled|Stopped) break ;;
+                InProgress|Stopping|Unknown|"") sleep 10 ;;
+                *) sleep 10 ;;
+              esac
+            done
+
+            if [ "$STATUS" != "Succeeded" ]; then
+              echo "❌ ${PIPELINE_NAME} ended with status=${STATUS}"
+              FAILURE="yes"; FAILED_PIPELINE="${PIPELINE_NAME}"; FAILED_INDEX=$i; break
+            fi
+
+            echo "✅ ${PIPELINE_NAME} succeeded (index=$i)"
+            i=$((i+1))
+          done
+        fi
+
+      
+        # 7) Persist final state; set NEED_APPROVAL for downstream VariableCheck
+      
+        # ensure ROLLBACK_BUCKET is set (override if needed)
+        ROLLBACK_BUCKET="${ROLLBACK_BUCKET:-rm-flow-controller-artifacts}"
+
+        if [ "$FAILURE" = "yes" ]; then
+          echo "📝 Building NEEDS_APPROVAL payload"
+          # build JSON payload safely
+          read -r -d '' NEEDS_APPROVAL_PAYLOAD <<EOF || true
+        {
+          "jira": "${JIRA_ID}",
+          "status": "NEEDS_APPROVAL",
+          "failed_pipeline": "${FAILED_PIPELINE}",
+          "index": ${FAILED_INDEX}
+        }
+        EOF
+
+          echo "📝 Writing NEEDS_APPROVAL state to state S3: s3://${STATE_BUCKET}/state/${JIRA_ID}.json"
+          printf "%s\n" "$NEEDS_APPROVAL_PAYLOAD" | aws s3 cp - "s3://${STATE_BUCKET}/state/${JIRA_ID}.json"
+
+          echo "📝 Also uploading rollback metadata to rollback S3: s3://${ROLLBACK_BUCKET}/rollback/rollback.json"
+          printf "%s\n" "$NEEDS_APPROVAL_PAYLOAD" | aws s3 cp - "s3://${ROLLBACK_BUCKET}/rollback/rollback.json"
+
+          # tolerate older/misspelled consumer by also writing rolback.json
+          echo "📝 (compat) uploading typo-key: s3://${ROLLBACK_BUCKET}/rollback/rolback.json"
+          printf "%s\n" "$NEEDS_APPROVAL_PAYLOAD" | aws s3 cp - "s3://${ROLLBACK_BUCKET}/rollback/rolback.json"
+
+          export NEED_APPROVAL="true"
+          echo "⚠️ ${JIRA_ID}: One or more pipelines FAILED. Manual Approval stage will now trigger."
+          echo "👉 Ops can fix the issue manually, then click *Approve* to let Controller-2 resume releases."
+          echo "👉 If you Reject, rollback will start for the already-completed pipelines."
+        else
+          echo "📝 Writing OK state to S3"
+          echo "{\"jira\":\"${JIRA_ID}\",\"status\":\"OK\",\"last_index\":-1}" \
+            | aws s3 cp - "s3://${STATE_BUCKET}/state/${JIRA_ID}.json"
+          export NEED_APPROVAL="false"
+          echo "🎉 Booyah! All pipelines for JIRA ${JIRA_ID} succeeded — skipping Manual Approval and remaining gates."
+        fi
+
+        echo "🏁 Controller-4 finished (exit always 0)."
+        exit 0
+
+  post_build:
+    commands:
+      - |
+        echo "Resetting AWS credentials to CodeBuild role..."
+
+        unset AWS_ACCESS_KEY_ID
+        unset AWS_SECRET_ACCESS_KEY
+        unset AWS_SESSION_TOKEN
+
+        exec > >(stdbuf -oL tee -a /tmp/build.log) 2>&1
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [POST_BUILD] UPLOADING_LOGS"
+        S3_PATH="s3://nonprod-release-management-codebuild-logs/pipeline-logs/$PIPELINE_EXECUTION_ID/$STAGE_NAME/build.log"
+        aws s3 cp /tmp/build.log "$S3_PATH"
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [POST_BUILD] LOGS_UPLOADED_TO=$S3_PATH"
