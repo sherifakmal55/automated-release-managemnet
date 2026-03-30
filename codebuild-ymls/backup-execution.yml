@@ -1,0 +1,1613 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.11
+    commands:
+      - yum install -y coreutils || true
+      - |
+        exec > >(stdbuf -oL tee -a /tmp/build.log) 2>&1
+        echo "📦 Installing tools..."
+        yum install -y jq awscli
+        echo "✅ Install complete"
+        echo PIPELINE_EXECUTION_ID=$PIPELINE_EXECUTION_ID
+        echo STAGE_NAME=$STAGE_NAME
+
+  build:
+    commands:
+      - | 
+        exec > >(stdbuf -oL tee -a /tmp/build.log) 2>&1 
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [BUILD]  📥 Reading task.json..."
+        cp $CODEBUILD_SRC_DIR_ValidatedOutput/task.json task.json
+        cat task.json
+
+      
+        echo "📁 Storing task.json into Parameter Store under /rm-flow-controller/<JIRA_ID> ..."
+
+        # extract JIRA_ID from task.json
+        JIRA_ID=$(jq -r '.jira_ticket // empty' task.json)
+        if [[ -z "$JIRA_ID" ]]; then
+          echo "❌ jira_ticket not found in task.json; cannot create parameter path"
+          exit 1
+        fi
+
+        # compact JSON to one line (safe for SSM)
+        TASK_JSON_COMPACT=$(jq -c . task.json) || { echo "❌ failed to compact task.json"; exit 1; }
+
+        # determine region: prefer existing $REGION, else env vars, else default
+        REGION="${REGION:-${AWS_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}}"
+
+        PARAM_NAME="/rm-flow-controller/${JIRA_ID}/task.json"
+
+        echo "🔐 Putting Parameter Store value at ${PARAM_NAME} (region=${REGION}) ..."
+        aws ssm put-parameter \
+          --name "$PARAM_NAME" \
+          --value "$TASK_JSON_COMPACT" \
+          --type String \
+          --overwrite \
+          --region "$REGION" \
+          >/dev/null 2>&1 \
+          && echo "✅ task.json stored at Parameter Store: $PARAM_NAME (created/overwritten)" \
+          || { echo "❌ Failed to put parameter to SSM ($PARAM_NAME)"; aws ssm put-parameter --name "$PARAM_NAME" --value "$TASK_JSON_COMPACT" --type String --overwrite --region "$REGION" --debug || true; exit 1; }
+        echo "🚀 Starting backup execution (collect WAR info before assume-role)..."
+      
+        set -euo pipefail
+
+        echo "📌 Extracting metadata..."
+        CLIENT=$(jq -r '.client' task.json)
+        ENV=$(jq -r '.env' task.json)
+        JIRA_ID=$(jq -r '.jira_ticket' task.json)
+        VERSION=$(jq -r '.version' task.json)
+        echo "✅ Fields loaded: CLIENT=${CLIENT} ENV=${ENV} JIRA=${JIRA_ID} VER=${VERSION}"
+
+        echo "📥 Fetching Parameter Store JSON..."
+        PARAM_PATH="/arm-cpr/$CLIENT/$ENV/details.json"
+        PARAM_JSON=$(aws ssm get-parameter --name "$PARAM_PATH" --with-decryption --query 'Parameter.Value' --output text)
+        echo "✅ Parameter JSON fetched"
+
+        REGION=$(echo "$PARAM_JSON" | jq -r '.region')
+        ROLE_ARN=$(echo "$PARAM_JSON" | jq -r '.assume_role_arn')
+        SQL_INSTANCE_ID=$(echo "$PARAM_JSON" | jq -r '.task_type_mappings.sqlserver_instance_id')
+        ORACLE_HOST=$(echo "$PARAM_JSON" | jq -r '.database_details.oracle_host')
+        ORACLE_PORT=$(echo "$PARAM_JSON" | jq -r '.database_details.oracle_port')
+        ORACLE_SID=$(echo "$PARAM_JSON" | jq -r '.database_details.oracle_sid')
+        ORACLE_USER=$(echo "$PARAM_JSON" | jq -r '.database_details.oracle_user')
+        JBOSS_PATH=$(echo "$PARAM_JSON" | jq -r '.wildfly_details.jboss_path')
+        JAVA_PATH=$(echo "$PARAM_JSON" | jq -r '.wildfly_details.java_path')
+        JBOSS_USER=$(echo "$PARAM_JSON" | jq -r '.wildfly_details.jboss_user')
+        MGMT_PORT=$(echo "$PARAM_JSON" | jq -r '.wildfly_details.jbosscli_port')
+        SECRET_ARN=$(echo "$PARAM_JSON" | jq -r '.database_details.secret_arn')
+        ORACLE_PATH=$(echo "$PARAM_JSON" | jq -r '.database_details.oracle_path')
+
+        # JDBC URL for CT backup
+        DB_URL="jdbc:oracle:thin:@${ORACLE_HOST}:${ORACLE_PORT}:${ORACLE_SID}"
+
+        # S3 base (already includes bucket + prefix), e.g. s3://stl-<client>-housekeeping/release-management
+        BUCKET_BASE=$(echo "$PARAM_JSON" | jq -r '.backup_s3_details.bucket_name')
+
+        if [[ -z "$REGION" || "$REGION" == "null" || -z "$ROLE_ARN" || "$ROLE_ARN" == "null" ]]; then
+          echo "❌ region/assume_role_arn missing in Parameter Store"; exit 1
+        fi
+        echo "✅ REGION=${REGION} and ROLE_ARN present"
+
+        # Assume role to access Secrets Manager
+        ASSUME_ROLE_OUTPUT=$(aws sts assume-role \
+          --role-arn "$ROLE_ARN" \
+          --role-session-name "CodeBuildSession" \
+          --region "$REGION")
+
+        export AWS_ACCESS_KEY_ID=$(echo "$ASSUME_ROLE_OUTPUT" | jq -r '.Credentials.AccessKeyId')
+        export AWS_SECRET_ACCESS_KEY=$(echo "$ASSUME_ROLE_OUTPUT" | jq -r '.Credentials.SecretAccessKey')
+        export AWS_SESSION_TOKEN=$(echo "$ASSUME_ROLE_OUTPUT" | jq -r '.Credentials.SessionToken')
+
+        # Fetch secret from Secrets Manager
+        SECRET_JSON=$(aws secretsmanager get-secret-value \
+          --secret-id "$SECRET_ARN" \
+          --region "$REGION" \
+          --query "SecretString" \
+          --output text)
+
+        # Extract Oracle password
+        ORACLE_PASS=$(echo "$SECRET_JSON" | jq -r '.password')
+        echo "✅ Password exported and stored as a ORACLE_PASS variable"
+
+        echo $ORACLE_PASS
+
+        
+        # Unset temporary credentials
+        unset AWS_ACCESS_KEY_ID
+        unset AWS_SECRET_ACCESS_KEY
+        unset AWS_SESSION_TOKEN
+
+        #############################################
+        # PRE-COLLECT WAR TASKS (2+3 variables model)
+        #############################################
+        echo "🎭 Collecting WAR deployment details (pre-assume-role)..."
+
+        TASK_JSON_TEXT="$(cat task.json)"
+        
+        jq -n \
+          --argjson t "${TASK_JSON_TEXT}" \
+          --argjson p "${PARAM_JSON}" '
+            [
+              $t.backup[]
+              | select(.task_type | test("^WarDeployment"; "i"))
+              | {
+                  comp: ((.server_name // .server) | ascii_downcase),
+                  war_file: (.war_to_backup // ""),
+                  iid: ( $p.Instance_mappings[((.server_name // .server | ascii_downcase) + "_instance_id")] // "" )
+                }
+              | select(.comp != "" and .war_file != "" and .iid != "")
+            ]
+          ' > war_tasks_exec.json
+
+
+        echo "📄 WAR tasks (ready):"
+        jq . war_tasks_exec.json
+        WAR_READY=$(jq 'length' war_tasks_exec.json)
+        echo "✅ WAR tasks ready for execution: ${WAR_READY}"
+
+        echo "🔐 Assuming client account role..."
+        CREDS=$(aws sts assume-role --role-arn "$ROLE_ARN" --role-session-name Stage4BackupSession)
+        export AWS_ACCESS_KEY_ID=$(echo "$CREDS" | jq -r '.Credentials.AccessKeyId')
+        export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r '.Credentials.SecretAccessKey')
+        export AWS_SESSION_TOKEN=$(echo "$CREDS" | jq -r '.Credentials.SessionToken')
+        echo "✅ AssumeRole success"
+
+        echo "🔁 Processing backup tasks..."
+        SUCCESS_LIST=""
+        FAIL_LIST=""
+
+        #################################
+        # 1) DATABASE BACKUPS  
+        #################################
+        jq -c '.backup[]' task.json | while IFS= read -r TASK_JSON_ROW; do
+          TASK_TYPE=$(echo "$TASK_JSON_ROW" | jq -r '.task_type')
+
+          # Handle numbered task types by stripping the number
+          BASE_TASK_TYPE=$(echo "$TASK_TYPE" | sed 's/[0-9]*$//')  # Remove trailing numbers
+
+          case "$BASE_TASK_TYPE" in
+            "DatabaseProcedure")
+              OBJECT_NAMES=$(echo "$TASK_JSON_ROW" | jq -r '.procedure_to_backup[]?')
+              DIR_NAME="DatabaseProcedure"
+              SCRIPT="backup-sqlprocedure.sh"
+              ;;
+            "DatabaseFunction")
+              OBJECT_NAMES=$(echo "$TASK_JSON_ROW" | jq -r '.functions_to_backup[]?')
+              DIR_NAME="DatabaseFunction"
+              SCRIPT="backup-sqlfunction.sh"
+              ;;
+            "DatabaseView")
+              OBJECT_NAMES=$(echo "$TASK_JSON_ROW" | jq -r '.views_to_backup[]?')
+              
+              DIR_NAME="DatabaseView"
+              SCRIPT="backup-sqlview.sh"
+              ;;
+            "DatabaseTable")
+              OBJECT_NAMES=$(echo "$TASK_JSON_ROW" | jq -r '.tables_to_backup[]?')
+              DIR_NAME="DatabaseTable"
+              SCRIPT="backup-sqltable.sh"
+              ;;
+            *)
+              # ignore non-DB backup items in backup[]
+              echo "⚠️  Unknown task type: ${TASK_TYPE}, skipping..."
+              continue
+              ;;
+          esac
+
+          # Check if OBJECT_NAMES is empty or null
+          if [[ -z "${OBJECT_NAMES:-}" || "$OBJECT_NAMES" == "null" ]]; then
+            echo "❌ Skipping: No objects found for ${TASK_TYPE}"
+            FAIL_LIST+="${TASK_TYPE} → NO_OBJECTS"$'\n'
+            continue
+          fi
+
+          if [[ -z "${SQL_INSTANCE_ID:-}" || "$SQL_INSTANCE_ID" == "null" ]]; then
+            echo "❌ Skipping: SQL instance id missing in Parameter Store"
+            FAIL_LIST+="${TASK_TYPE} → MULTIPLE_OBJECTS (no SQL instance)"$'\n'
+            continue
+          fi
+
+          SCRIPT_PATH="/tmp/${JIRA_ID}/scripts/${SCRIPT}"
+          BACKUP_DIR="/tmp/${JIRA_ID}/backup/${DIR_NAME}"
+          S3_UPLOAD_PATH="${BUCKET_BASE%/}/${JIRA_ID}/${DIR_NAME}"
+
+          echo "📁 Creating dir: ${BACKUP_DIR} on ${SQL_INSTANCE_ID}"
+          
+          # Loop through each object name
+          echo "$OBJECT_NAMES" | while IFS= read -r OBJECT_NAME; do
+            if [[ -z "${OBJECT_NAME:-}" || "$OBJECT_NAME" == "null" ]]; then
+              echo "❌ Skipping: Empty object name in ${TASK_TYPE}"
+              FAIL_LIST+="${TASK_TYPE} → EMPTY_OBJECT"$'\n'
+              continue
+            fi
+
+            echo "🧪 Running DB script: ${SCRIPT} for ${OBJECT_NAME} (Task: ${TASK_TYPE})"
+
+            if [[ "$BASE_TASK_TYPE" == "DatabaseTable" ]]; then
+              CMD="bash ${SCRIPT_PATH} ${ORACLE_HOST} ${ORACLE_PORT} ${ORACLE_SID} ${ORACLE_USER} ${ORACLE_PASS} ${OBJECT_NAME} ${JIRA_ID} ${ORACLE_PATH}"
+            else
+              CMD="bash ${SCRIPT_PATH} ${ORACLE_HOST} ${ORACLE_PORT} ${ORACLE_SID} ${ORACLE_USER} ${ORACLE_PASS} ${OBJECT_NAME} ${BACKUP_DIR} ${JIRA_ID} ${S3_UPLOAD_PATH} ${ORACLE_PATH}"
+            fi
+
+            PARAMS_JSON=$(printf '{"commands":["mkdir -p %s","%s"]}' "${BACKUP_DIR}" "${CMD}")
+
+            echo $PARAMS_JSON
+
+            CMD_ID=$(aws ssm send-command \
+              --document-name "AWS-RunShellScript" \
+              --instance-ids "${SQL_INSTANCE_ID}" \
+              --parameters "${PARAMS_JSON}" \
+              --comment "Backup: ${TASK_TYPE} → ${OBJECT_NAME}" \
+              --region "${REGION}" \
+              --query "Command.CommandId" --output text)
+
+            if [[ -z "$CMD_ID" || "$CMD_ID" == "None" ]]; then
+              echo "❌ Failed to start SSM command for ${TASK_TYPE} → ${OBJECT_NAME}"
+              FAIL_LIST+="${TASK_TYPE} → ${OBJECT_NAME}"$'\n'
+              continue
+            fi
+
+            echo "⏳ Waiting for SSM command (${CMD_ID}) for ${OBJECT_NAME}..."
+            if ! aws ssm wait command-executed --command-id "${CMD_ID}" --instance-id "${SQL_INSTANCE_ID}" --region "${REGION}"; then
+              echo "❌ SSM waiter reported failure for ${OBJECT_NAME}"
+            fi
+
+            OUT=$(aws ssm get-command-invocation \
+              --command-id "${CMD_ID}" \
+              --instance-id "${SQL_INSTANCE_ID}" \
+              --region "${REGION}" \
+              --output json)
+
+            ST=$(echo "$OUT"   | jq -r '.Status')
+            SO=$(echo "$OUT"   | jq -r '.StandardOutputContent')
+            SE=$(echo "$OUT"   | jq -r '.StandardErrorContent')
+
+            echo "📄 Status for ${OBJECT_NAME}: ${ST}"
+            echo "📤 Output for ${OBJECT_NAME}:"
+            echo "$SO"
+
+            if [[ "$ST" == "Success" ]]; then
+              echo "✅ ${TASK_TYPE} → ${OBJECT_NAME} backup succeeded"
+              SUCCESS_LIST+="${TASK_TYPE} → ${OBJECT_NAME}"$'\n'
+            else
+              echo "❌ ${TASK_TYPE} → ${OBJECT_NAME} backup failed"
+              echo "🪵 Error Log for ${OBJECT_NAME}:"
+              echo "$SE"
+              FAIL_LIST+="${TASK_TYPE} → ${OBJECT_NAME}"$'\n'
+            fi
+            echo "----------------------------------------"
+          done
+        done
+
+        #################################
+        # 2) WAR BACKUPS (from deploy[])
+        #################################
+        echo "🛡️ Executing WAR backups..."
+        WAR_COUNT=$(jq 'length' war_tasks_exec.json)
+        if [[ "$WAR_COUNT" -eq 0 ]]; then
+          echo "ℹ️ No executable WAR tasks (either none found or missing mapping/file)"
+        fi
+
+        S3_WAR_UPLOAD="${BUCKET_BASE%/}/${JIRA_ID}/WAR"
+
+        while IFS= read -r ROW; do
+          COMP=$(echo "$ROW" | jq -r '.comp')
+          WAR_FILE=$(echo "$ROW" | jq -r '.war_file')
+          WAR_INSTANCE=$(echo "$ROW" | jq -r '.iid')
+
+          WAR_SCRIPT="/tmp/${JIRA_ID}/scripts/backup-war.sh"
+          # Added JBOSS_PATH, JAVA_PATH and MGMT_PORT as extra args (no other changes)
+          WAR_CMD="bash ${WAR_SCRIPT} \"${WAR_FILE}\" \"${JIRA_ID}\" \"${S3_WAR_UPLOAD}\" \"${JBOSS_PATH}\" \"${JAVA_PATH}\" \"${MGMT_PORT}\" \"${JBOSS_USER}\""
+
+          echo "🧪 WAR backup on ${COMP} (${WAR_INSTANCE}): file=${WAR_FILE}"
+          WAR_PAYLOAD=$(jq -n --arg cmd "$WAR_CMD" '{commands: [$cmd]}')
+
+          WAR_CMD_ID=$(aws ssm send-command \
+            --document-name "AWS-RunShellScript" \
+            --instance-ids "${WAR_INSTANCE}" \
+            --parameters "${WAR_PAYLOAD}" \
+            --comment "WAR backup: ${COMP} → ${WAR_FILE}" \
+            --region "${REGION}" \
+            --query "Command.CommandId" --output text)
+
+          if [[ -z "$WAR_CMD_ID" || "$WAR_CMD_ID" == "None" ]]; then
+            echo "❌ Failed to start SSM for WAR backup (${COMP})"
+            FAIL_LIST+="WARDeployment → ${COMP} (${WAR_FILE})"$'\n'
+            continue
+          fi
+
+          echo "⏳ Waiting for SSM command (${WAR_CMD_ID}) on ${WAR_INSTANCE}..."
+          if ! aws ssm wait command-executed --command-id "${WAR_CMD_ID}" --instance-id "${WAR_INSTANCE}" --region "${REGION}"; then
+            echo "❌ SSM waiter reported failure (WAR ${COMP})"
+          fi
+
+          WR=$(aws ssm get-command-invocation \
+            --command-id "${WAR_CMD_ID}" \
+            --instance-id "${WAR_INSTANCE}" \
+            --region "${REGION}" \
+            --output json)
+
+          WS=$(echo "$WR" | jq -r '.Status')
+          WSO=$(echo "$WR" | jq -r '.StandardOutputContent')
+          WSE=$(echo "$WR" | jq -r '.StandardErrorContent')
+
+          echo "📄 WAR Status (${COMP}): ${WS}"
+          echo "📤 WAR Output:"
+          echo "$WSO"
+
+          if [[ "$WS" == "Success" ]]; then
+            echo "✅ WARDeployment → ${COMP} backup succeeded"
+            SUCCESS_LIST+="WARDeployment → ${COMP} (${WAR_FILE})"$'\n'
+          else
+            echo "❌ WARDeployment → ${COMP} backup failed"
+            echo "🪵 Error Log:"
+            echo "$WSE"
+            FAIL_LIST+="WARDeployment → ${COMP} (${WAR_FILE})"$'\n'
+          fi
+        done < <(jq -c '.[]' war_tasks_exec.json)
+
+        #################################
+        # 2.5) LINUX BACKUPS (from backup[])
+        #################################
+        echo "🐧 Executing LINUX backups..."
+        LINUX_TASKS_IN_JSON=$(jq '[.backup[] | select(.task_type | test("^LinuxPackages"; "i"))] | length' task.json)
+
+        if [[ "$LINUX_TASKS_IN_JSON" -eq 0 ]]; then
+            echo "ℹ️ No LinuxPackages entries found in task.json - skipping LINUX backup process"
+        else
+            # Extract only the bucket name from BUCKET_BASE, whether it's "stl-xxx" or "s3://stl-xxx/prefix"
+            LINUX_BUCKET=$(printf '%s' "$BUCKET_BASE" | sed -E 's#^s3://##' | cut -d/ -f1)
+
+            for ROW in $(jq -c '.backup[] | select(.task_type | test("^LinuxPackages"; "i"))' task.json); do
+                TASK_TYPE=$(echo "$ROW" | jq -r '.task_type')
+                L_SERVER=$(echo "$ROW" | jq -r '.server // .server_name')
+                L_FILE=$(echo "$ROW"   | jq -r '.file_to_backup')
+                L_PATH=$(echo "$ROW"   | jq -r '.file_path')
+
+                if [[ -z "${L_SERVER:-}" || "$L_SERVER" == "null" ]]; then
+                    echo "⚠️ Skipping LinuxPackages backup (no server specified)";
+                    FAIL_LIST+="${TASK_TYPE} → <no server>"$'\n'
+                    continue
+                fi
+
+                # Map instance id: prefer Instance_mappings["<server>_instance_id"], fallback to task_type_mappings.linuxpackages_instance_id if present
+                L_KEY="$(echo "$L_SERVER" | tr '[:upper:]' '[:lower:]')_instance_id"
+                L_IID=$(echo "$PARAM_JSON" | jq -r --arg k "$L_KEY" '.Instance_mappings[$k]')
+                if [[ -z "${L_IID:-}" || "$L_IID" == "null" ]]; then
+                    L_IID=$(echo "$PARAM_JSON" | jq -r '.task_type_mappings.linuxpackages_instance_id // empty')
+                fi
+
+                if [[ -z "${L_IID:-}" || "$L_IID" == "null" ]]; then
+                    echo "❌ No instance mapping for Linux server '${L_SERVER}'"
+                    FAIL_LIST+="${TASK_TYPE} → ${L_SERVER} (${L_FILE})"$'\n'
+                    continue
+                fi
+
+                if [[ -z "${L_FILE:-}" || "$L_FILE" == "null" || -z "${L_PATH:-}" || "$L_PATH" == "null" ]]; then
+                    echo "❌ Missing file_to_backup or file_path for Linux server '${L_SERVER}'"
+                    FAIL_LIST+="${TASK_TYPE} → ${L_SERVER} (missing inputs)"$'\n'
+                    continue
+                fi
+
+                L_SCRIPT="/tmp/${JIRA_ID}/scripts/backup-linux.sh"
+                L_CMD="bash ${L_SCRIPT} \"${JIRA_ID}\" \"${L_FILE}\" \"${L_PATH}\" \"${LINUX_BUCKET}\""
+
+                echo "🧪 LinuxPackages backup on ${L_SERVER} (${L_IID}): file=${L_FILE} path=${L_PATH} (Task: ${TASK_TYPE})"
+                L_PAYLOAD=$(jq -n --arg cmd "$L_CMD" '{commands: [$cmd]}')
+
+                L_CMD_ID=$(aws ssm send-command \
+                    --document-name "AWS-RunShellScript" \
+                    --instance-ids "${L_IID}" \
+                    --parameters "${L_PAYLOAD}" \
+                    --comment "LinuxPackages backup: ${TASK_TYPE} → ${L_SERVER} → ${L_FILE}" \
+                    --region "${REGION}" \
+                    --query "Command.CommandId" --output text)
+
+                if [[ -z "$L_CMD_ID" || "$L_CMD_ID" == "None" ]]; then
+                    echo "❌ Failed to start SSM for LinuxPackages backup (${TASK_TYPE} → ${L_SERVER})"
+                    FAIL_LIST+="${TASK_TYPE} → ${L_SERVER} (${L_FILE})"$'\n'
+                    continue
+                fi
+
+                echo "⏳ Waiting for SSM command (${L_CMD_ID}) on ${L_IID}..."
+                if ! aws ssm wait command-executed --command-id "${L_CMD_ID}" --instance-id "${L_IID}" --region "${REGION}"; then
+                    echo "❌ SSM waiter reported failure (LinuxPackages ${TASK_TYPE} → ${L_SERVER})"
+                fi
+
+                LR=$(aws ssm get-command-invocation \
+                    --command-id "${L_CMD_ID}" \
+                    --instance-id "${L_IID}" \
+                    --region "${REGION}" \
+                    --output json)
+
+                LS=$(echo "$LR" | jq -r '.Status')
+                LSO=$(echo "$LR" | jq -r '.StandardOutputContent')
+                LSE=$(echo "$LR" | jq -r '.StandardErrorContent')
+
+                echo "📄 LinuxPackages Status (${TASK_TYPE} → ${L_SERVER}): ${LS}"
+                echo "📤 LinuxPackages Output:"
+                echo "$LSO"
+
+                if [[ "$LS" == "Success" ]]; then
+                    echo "✅ ${TASK_TYPE} → ${L_SERVER} backup succeeded"
+                    SUCCESS_LIST+="${TASK_TYPE} → ${L_SERVER} (${L_FILE})"$'\n'
+                else
+                    echo "❌ ${TASK_TYPE} → ${L_SERVER} backup failed"
+                    echo "🪵 Error Log:"
+                    echo "$LSE"
+                    FAIL_LIST+="${TASK_TYPE} → ${L_SERVER} (${L_FILE})"$'\n'
+                fi
+                echo "----------------------------------------"
+            done
+        fi
+
+        #################################
+        # 3) CONTROL BACKUPS (get-project-id -> modular-export) with debug
+        #################################
+        echo "🔧 Executing CONTROL backups..."
+
+        # Debug: print raw task.json size and head
+        echo "📂 task.json size: $(stat -c%s task.json) bytes"
+        echo "📄 task.json preview (first 10 lines):"
+        head -n 10 task.json
+
+        CONTROL_TASKS_IN_JSON=$(jq '[.backup[] | select(.task_type | test("^Control"; "i"))] | length' task.json 2>jq_error.log) || {
+          echo "❌ jq failed when reading control tasks: $(cat jq_error.log)"
+          exit 1
+        }
+        echo "✅ Found $CONTROL_TASKS_IN_JSON control backup entries"
+
+        if [[ "$CONTROL_TASKS_IN_JSON" -eq 0 ]]; then
+          echo "ℹ️ No Control backup entries found in task.json - skipping CONTROL backup process"
+        else
+          echo "🔧 Executing CONTROL backups (get-project-id -> modular-export)..."
+
+          # Read control_details once with debug output
+          WC_USER=$(echo "$PARAM_JSON" | jq -r '.control_details.wc_user')
+          WC_PASS=$(echo "$PARAM_JSON" | jq -r '.control_details.wc_password')
+          CONTROL_IP=$(echo "$PARAM_JSON" | jq -r '.control_details.control_server_ip')
+          CONTROL_PORT=$(echo "$PARAM_JSON" | jq -r '.control_details.control_server_port')
+          JAVA_PATH=$(echo "$PARAM_JSON" | jq -r '.wildfly_details.java_path')
+
+          echo "🔍 Read control_details: wc_user=${WC_USER:-null}, wc_password=${WC_PASS:+****}, ip=${CONTROL_IP:-null}, port=${CONTROL_PORT:-null}, java_path=${JAVA_PATH:-null}"
+
+          # Normalize "null" to empty
+          [[ "$WC_USER" == "null" ]] && WC_USER=""
+          [[ "$WC_PASS" == "null" ]] && WC_PASS=""
+          [[ "$CONTROL_IP" == "null" ]] && CONTROL_IP=""
+          [[ "$CONTROL_PORT" == "null" ]] && CONTROL_PORT=""
+
+          if [[ -z "$WC_USER" || -z "$WC_PASS" || -z "$CONTROL_IP" || -z "$CONTROL_PORT" ]]; then
+            echo "⚠️ One or more control_details keys missing in Parameter Store. CONTROL backups may fail."
+          else
+            echo "✅ control_details present (wc_user and server details loaded)"
+          fi
+
+          # helper to mask password in outputs
+          mask() {
+            local s="$1"
+            if [[ -n "${WC_PASS:-}" ]]; then
+              # mask all occurrences of the password
+              printf '%s' "$s" | sed "s|${WC_PASS}|****|g"
+            else
+              printf '%s' "$s"
+            fi
+          }
+
+          # Debug: print the jq raw output filtered for Control tasks before looping
+          echo "📋 jq filtered Control backup tasks (compact):"
+          if ! jq -c '.backup[] | select(.task_type | test("^Control"; "i"))' task.json > control_tasks.json 2>jq_loop_error.log; then
+            echo "❌ jq failed filtering control backup tasks: $(cat jq_loop_error.log)"
+            exit 1
+          fi
+          cat control_tasks.json
+
+          # Iterate safe
+          jq -c '.backup[] | select(.task_type | test("^Control"; "i"))' task.json | while IFS= read -r ROW; do
+            echo "🧾 Processing raw control task row: $ROW"
+
+            TASK_TYPE=$(echo "$ROW" | jq -r '.task_type')
+            PROJECT_TO_BACKUP=$(echo "$ROW" | jq -r '.project_to_backup')
+            SERVER_NAME=$(echo "$ROW" | jq -r '(.server // .server_name)')
+
+            echo "➡️ CONTROL task: ${TASK_TYPE} project_to_backup='${PROJECT_TO_BACKUP}' server='${SERVER_NAME}'"
+
+
+
+            if [[ -z "${PROJECT_TO_BACKUP}" ]]; then
+              echo "❌ Missing project_to_backup for ${TASK_TYPE} — skipping"
+              FAIL_LIST+="CONTROL → ${TASK_TYPE} (missing project_to_backup)"$'\n'
+              continue
+            fi
+
+            # Map control server instance id
+            CTRL_KEY="$(echo "$SERVER_NAME" | tr '[:upper:]' '[:lower:]')_instance_id"
+            CTRL_IID=$(echo "$PARAM_JSON" | jq -r --arg k "$CTRL_KEY" '.Instance_mappings[$k]')
+
+            if [[ -z "${CTRL_IID}" || "${CTRL_IID}" == "null" ]]; then
+              # fallback: task_type mapping (optional)
+              CTRL_IID=$(echo "$PARAM_JSON" | jq -r '.task_type_mappings.control_instance_id')
+            fi
+
+            if [[ -z "${CTRL_IID}" || "${CTRL_IID}" == "null" ]]; then
+              echo "❌ No instance mapping for CONTROL server '${SERVER_NAME}' (key=${CTRL_KEY})"
+              FAIL_LIST+="CONTROL → ${TASK_TYPE} (${PROJECT_TO_BACKUP}) (no instance mapping)"$'\n'
+              continue
+            fi
+
+            # 3.a) Run backup-get-project-id.sh on SQL instance to fetch project_id
+            if [[ -z "${SQL_INSTANCE_ID}" || "${SQL_INSTANCE_ID}" == "null" ]]; then
+              echo "❌ SQL instance id not available. Cannot run backup-get-project-id.sh"
+              FAIL_LIST+="CONTROL → ${TASK_TYPE} (${PROJECT_TO_BACKUP}) (no SQL instance)"$'\n'
+              continue
+            fi
+
+            echo "🧾 Running backup-get-project-id.sh on SQL instance ${SQL_INSTANCE_ID} for project '${PROJECT_TO_BACKUP}'"
+
+            CMDS_GET=$(jq -n --arg jira "$JIRA_ID" '{commands: ["set -euo pipefail", "cd /tmp/" + $jira + "/scripts || true"]}')
+            CMDS_GET=$(echo "$CMDS_GET" | jq --arg host "$ORACLE_HOST" --arg port "$ORACLE_PORT" --arg sid "$ORACLE_SID" --arg user "$ORACLE_USER" --arg pass "$ORACLE_PASS" --arg proj "'$PROJECT_TO_BACKUP'" --arg script "./backup-get-project-id.sh" --arg oracle_path "$ORACLE_PATH" '.commands += [($script + " " + $host + " " + $port + " " + $sid + " " + $user + " " + $pass + " " + $proj + " " + $oracle_path)]')
+
+            echo "$CMDS_GET" > commands_get_project.json
+
+            GET_CMD_ID=$(aws ssm send-command \
+              --document-name "AWS-RunShellScript" \
+              --instance-ids "${SQL_INSTANCE_ID}" \
+              --comment "get-project-id for ${PROJECT_TO_BACKUP}" \
+              --parameters file://commands_get_project.json \
+              --region "${REGION}" \
+              --query 'Command.CommandId' --output text)
+
+            if [[ -z "$GET_CMD_ID" || "$GET_CMD_ID" == "None" ]]; then
+              echo "❌ Failed to send get-project-id command to ${SQL_INSTANCE_ID}"
+              FAIL_LIST+="CONTROL → ${TASK_TYPE} (${PROJECT_TO_BACKUP}) (get-project-id send failed)"$'\n'
+              continue
+            fi
+
+            echo "⏳ Waiting for get-project-id command (${GET_CMD_ID})..."
+            if ! aws ssm wait command-executed --command-id "${GET_CMD_ID}" --instance-id "${SQL_INSTANCE_ID}" --region "${REGION}"; then
+              echo "❌ SSM waiter reported failure for get-project-id"
+            fi
+
+            OUT_GET=$(aws ssm get-command-invocation --command-id "${GET_CMD_ID}" --instance-id "${SQL_INSTANCE_ID}" --region "${REGION}" --output json)
+            GET_STATUS=$(echo "$OUT_GET" | jq -r '.Status')
+            GET_STDOUT=$(echo "$OUT_GET" | jq -r '.StandardOutputContent // ""')
+            GET_STDERR=$(echo "$OUT_GET" | jq -r '.StandardErrorContent // ""')
+
+            echo "📄 get-project-id Status: ${GET_STATUS}"
+            echo "📤 get-project-id Output:"
+            echo "$GET_STDOUT"
+            if [[ -n "$GET_STDERR" ]]; then
+              echo "🪵 get-project-id Stderr:"
+              echo "$GET_STDERR"
+            fi
+
+            # extract a UUID from stdout (last occurrence)
+            PROJECT_ID=$(echo "$GET_STDOUT" | grep -Eo -i '([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|SYSTEM[[:alnum:]_-]*PROJECT[[:alnum:]_-]*)' | tail -n1 || true)
+
+            PROJECT_ID=${PROJECT_ID//$'\r'/}
+
+            if [[ -z "${PROJECT_ID}" ]]; then
+              echo "❌ Could not extract PROJECT_ID from get-project-id output — skipping CONTROL backup"
+              FAIL_LIST+="CONTROL → ${TASK_TYPE} (${PROJECT_TO_BACKUP}) (no project_id)"$'\n'
+              continue
+            fi
+
+            echo "✅ Obtained PROJECT_ID='${PROJECT_ID}' for project '${PROJECT_TO_BACKUP}'"
+
+            # 3.b) Run backup-modularexport.sh on control instance (CTRL_IID)
+            echo "🧪 Preparing backup-modularexport.sh for CONTROL instance ${CTRL_IID} (project_id=${PROJECT_ID})"
+
+            S3_CONTROL_UPLOAD="${BUCKET_BASE%/}/${JIRA_ID}/Control"
+            SAFE_PROJ=$(echo "${PROJECT_TO_BACKUP}" | sed 's/ /_/g')
+            echo "🧪 $SAFE_PROJ"
+
+            # -------------------------------------------------------------------------
+            # Build commands_control_exec.json using template + placeholder replacement
+            # Template writes literal $VARIABLE names (no local expansion) so remote shell evaluates them.
+            # Note: __WCPASS__ is placed inside single quotes in the template -> '__WCPASS__'
+            # We will escape any single-quotes in the actual password to keep the single-quoted literal valid.
+            # -------------------------------------------------------------------------
+            cat > commands_control_exec.json <<'JSON_TPL'
+        {
+          "commands": [
+            "set -euo pipefail",
+            "mkdir -p /tmp/__JIRA__/control",
+            "UTIL_SUB=$(ls -1 /tmp/__JIRA__/utilities/control 2>/dev/null | grep -E '^tool' | head -n1 || true)",
+            "if [[ -n \"$UTIL_SUB\" ]]; then UTIL_PATH=\"/tmp/__JIRA__/utilities/control/$UTIL_SUB\"; else UTIL_PATH=\"/tmp/__JIRA__/utilities/control\"; fi",
+            "BACKUP_FILE=/tmp/__JIRA__/control/__PROJ____JIRA__.tcm",
+            "echo \"Using UTIL_PATH=$UTIL_PATH BACKUP_FILE=$BACKUP_FILE\"",
+            "/tmp/__JIRA__/scripts/backup-modularexport.sh \"$UTIL_PATH\" \"$BACKUP_FILE\" \"__WCUSER__\" __WCPASS__ \"__CTRLIP__\" \"__CTRLP__\" \"__PID__\" \"__JAVA_PATH__\"",
+            "if [[ -f \"$BACKUP_FILE\" ]]; then /usr/local/bin/aws s3 cp \"$BACKUP_FILE\" \"__S3UP__/\" --region __REG__; echo \"✅ Uploaded control backup to s3\"; else echo \"⚠️ Control backup file not created: $BACKUP_FILE\"; exit 3; fi"
+          ]
+        }
+        JSON_TPL
+
+            # Escape any single-quotes in the password so that the single-quoted literal remains valid on remote shell.
+            # Example transform:  don't'panic -> don'"'"'t'panic  (so it becomes safe inside single quotes)
+            PASS_ESC=$(printf '%s' "$WC_PASS" | sed "s/'/'\"'\"'/g")
+
+            # placeholder replacement
+            sed -e "s|__JIRA__|${JIRA_ID}|g" \
+                -e "s|__PROJ__|${SAFE_PROJ}|g" \
+                -e "s|__WCUSER__|${WC_USER//\"/\\\"}|g" \
+                -e "s|__WCPASS__|${WC_PASS}|g" \
+                -e "s|__CTRLIP__|${CONTROL_IP}|g" \
+                -e "s|__CTRLP__|${CONTROL_PORT}|g" \
+                -e "s|__PID__|${PROJECT_ID}|g" \
+                -e "s|__JAVA_PATH__|${JAVA_PATH}|g" \
+                -e "s|__S3UP__|${S3_CONTROL_UPLOAD}|g" \
+                -e "s|__REG__|${REGION}|g" \
+                commands_control_exec.json > commands_control_exec.json.tmp && mv commands_control_exec.json.tmp commands_control_exec.json
+
+            # -------------------------
+            # Debug & validation steps (UNMASKED, no masking)
+            # -------------------------
+            echo
+            echo "🔍 Debug (UNMASKED): driver variables:"
+            echo "  JIRA_ID: ${JIRA_ID}"
+            echo "  PROJECT_TO_BACKUP: ${PROJECT_TO_BACKUP}"
+            echo "  CTRL_IID: ${CTRL_IID}"
+            echo "  PROJECT_ID: ${PROJECT_ID}"
+            echo "  WC_USER: ${WC_USER}"
+            echo "  WC_PASS: ${WC_PASS}"
+            echo "  CONTROL_IP: ${CONTROL_IP}"
+            echo "  CONTROL_PORT: ${CONTROL_PORT}"
+            echo "  S3_CONTROL_UPLOAD: ${S3_CONTROL_UPLOAD}"
+            echo "  REGION: ${REGION}"
+            echo
+
+            echo "🔎 Debug: validate generated commands_control_exec.json is valid JSON (jq -e)"
+            if ! jq -e . commands_control_exec.json >/dev/null 2>&1; then
+              echo "❌ commands_control_exec.json is NOT valid JSON. Preview (UNMASKED):"
+              cat commands_control_exec.json || true
+              FAIL_LIST+="CONTROL → ${TASK_TYPE} (${PROJECT_TO_BACKUP}) (invalid JSON template)"$'\n'
+              continue
+            else
+              echo "✅ commands_control_exec.json is valid JSON"
+            fi
+
+            echo
+            echo "📋 Debug (UNMASKED): commands_control_exec.json content (raw):"
+            sed -n '1,200p' commands_control_exec.json || true
+            echo
+
+            # Print individual commands (numbered)
+            echo "🔢 Debug (UNMASKED): listing commands to be executed on the instance:"
+            jq -r '.commands[]' commands_control_exec.json | nl -ba | while IFS= read -r line; do
+              printf '%s\n' "$line"
+            done
+            echo
+
+            # Extract the modular-export command
+            MOD_CMD=$(jq -r '.commands[] | select(test("backup-modularexport.sh"))' commands_control_exec.json 2>/dev/null || true)
+            if [[ -n "$MOD_CMD" ]]; then
+              echo "⚙️ Debug (UNMASKED): final modular-export command that will be sent to instance:"
+              printf '%s\n' "$MOD_CMD"
+              echo
+            else
+              echo "⚠️ Debug: modular-export command not found in commands_control_exec.json"
+            fi
+
+            # Print aws ssm invocation preview
+            echo "📨 Debug: aws ssm send-command invocation (will use file://commands_control_exec.json):"
+            echo "aws ssm send-command --document-name AWS-RunShellScript --instance-ids \"${CTRL_IID}\" --comment \"modular-export for ${PROJECT_TO_BACKUP} (project_id=${PROJECT_ID})\" --parameters file://commands_control_exec.json --region \"${REGION}\""
+            echo
+
+            # Send SSM command
+            echo "📨 Sending SSM command to instance ${CTRL_IID}..."
+            CTRL_CMD_ID=$(aws ssm send-command \
+              --document-name "AWS-RunShellScript" \
+              --instance-ids "${CTRL_IID}" \
+              --comment "modular-export for ${PROJECT_TO_BACKUP} (project_id=${PROJECT_ID})" \
+              --parameters file://commands_control_exec.json \
+              --region "${REGION}" \
+              --query 'Command.CommandId' --output text) || true
+
+            if [[ -z "$CTRL_CMD_ID" || "$CTRL_CMD_ID" == "None" ]]; then
+              echo "❌ Failed to send modular-export command to ${CTRL_IID} (aws ssm send-command returned empty/None)"
+              echo "📋 Preview of commands_control_exec.json (raw):"
+              cat commands_control_exec.json || true
+              FAIL_LIST+="CONTROL → ${TASK_TYPE} (${PROJECT_TO_BACKUP}) (modular-export send failed)"$'\n'
+              continue
+            fi
+
+            echo "⏳ Waiting for modular-export command (${CTRL_CMD_ID}) on ${CTRL_IID}..."
+            if ! aws ssm wait command-executed --command-id "${CTRL_CMD_ID}" --instance-id "${CTRL_IID}" --region "${REGION}"; then
+              echo "❌ SSM waiter reported failure for modular-export (CommandId=${CTRL_CMD_ID})"
+            fi
+
+            # Safely fetch invocation output (capture raw)
+            RAW_OUT_CTRL=$(aws ssm get-command-invocation --command-id "${CTRL_CMD_ID}" --instance-id "${CTRL_IID}" --region "${REGION}" --output json 2>/dev/null || true)
+
+            # If RAW_OUT_CTRL is empty, try to print an error and continue
+            if [[ -z "${RAW_OUT_CTRL}" ]]; then
+              echo "❌ Failed to fetch command invocation for CommandId=${CTRL_CMD_ID} Instance=${CTRL_IID}"
+              FAIL_LIST+="CONTROL → ${TASK_TYPE} (${PROJECT_TO_BACKUP}) (no invocation output)"$'\n'
+              continue
+            fi
+
+            # Validate that RAW_OUT_CTRL is valid JSON before using jq
+            if ! printf '%s' "${RAW_OUT_CTRL}" | jq -e . >/dev/null 2>&1; then
+              echo "⚠️ get-command-invocation returned non-JSON or unexpected shape. Raw output:"
+              printf '%s\n' "${RAW_OUT_CTRL}"
+              # attempt to extract useful fields with grep as fallback
+              echo
+              echo "---- fallback raw output (grep) ----"
+              printf '%s\n' "${RAW_OUT_CTRL}" | sed -n '1,200p'
+              FAIL_LIST+="CONTROL → ${TASK_TYPE} (${PROJECT_TO_BACKUP}) (invocation not JSON)"$'\n'
+              continue
+            fi
+
+            # Now safely parse JSON fields
+            CTRL_STATUS=$(printf '%s' "${RAW_OUT_CTRL}" | jq -r '.Status // empty')
+            CTRL_STDOUT=$(printf '%s' "${RAW_OUT_CTRL}" | jq -r '.StandardOutputContent // ""')
+            CTRL_STDERR=$(printf '%s' "${RAW_OUT_CTRL}" | jq -r '.StandardErrorContent // ""')
+
+            echo "📄 modular-export Status: ${CTRL_STATUS}"
+            echo "📤 modular-export Output:"
+            printf '%s\n' "${CTRL_STDOUT}"
+            if [[ -n "${CTRL_STDERR}" ]]; then
+              echo "🪵 modular-export Stderr:"
+              printf '%s\n' "${CTRL_STDERR}"
+            fi
+
+            if [[ "${CTRL_STATUS}" == "Success" ]]; then
+              echo "✅ CONTROL backup for project '${PROJECT_TO_BACKUP}' succeeded"
+              SUCCESS_LIST+="CONTROL → ${TASK_TYPE} (${PROJECT_TO_BACKUP})"$'\n'
+            else
+              echo "❌ CONTROL backup for project '${PROJECT_TO_BACKUP}' failed"
+              FAIL_LIST+="CONTROL → ${TASK_TYPE} (${PROJECT_TO_BACKUP})"$'\n'
+            fi
+          done
+        fi
+
+        # #################################
+        # # 5) CONFIGURATION TRANSFER (CT)
+        # #################################
+        # echo "📌 Starting Configuration Transfer backup process"
+
+        # CT_TASKS_IN_JSON=$(jq '[.backup[] | select(.task_type | test("^ConfigurationTransfer"; "i"))] | length' task.json)
+
+        # if [[ "$CT_TASKS_IN_JSON" -eq 0 ]]; then
+        #     echo "No ConfigurationTransfer entries found in task.json - skipping CT backup process"
+        # else
+        #     echo "✅ Found $CT_TASKS_IN_JSON ConfigurationTransfer task(s) in task.json"
+            
+        #     for (( i=0; i<$(jq '.backup | length' task.json); i++ )); do
+        #         UNFORMATTED_TASK_TYPE=$(jq -r ".backup[$i].task_type" task.json)
+        #         TASK_TYPE=$(echo "$UNFORMATTED_TASK_TYPE" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z]//g')
+        #         if [[ "$TASK_TYPE" == "configurationtransfer" ]]; then
+        #             SERVER=$(jq -r ".backup[$i].server // empty" task.json)
+        #             CTE_FILE=$(jq -r ".backup[$i].created_backup_file" task.json)
+        #             TEMPLATE_FILE=$(jq -r ".backup[$i].template_file" task.json)
+        #             TASK_IDENTIFIER="$UNFORMATTED_TASK_TYPE"
+
+        #             # Determine DB_URL based on version (special case for RP-3.0.8)
+        #             if [[ "$VERSION" == "RP-3.0.8" ]]; then
+        #                 CT_DB_URL="${DB_URL#jdbc:}"
+        #                 echo "🔧 Version RP-3.0.8 detected — using modified DB URL (without 'jdbc:'): $CT_DB_URL"
+        #             else
+        #                 CT_DB_URL="$DB_URL"
+        #             fi
+
+        #             if [[ -n "$SERVER" ]]; then
+        #                 echo "🔍 Looking up instance ID for server '$SERVER'..."
+        #                 INSTANCE_ID=$(echo "$PARAM_JSON" | jq -r ".Instance_mappings.\"${SERVER}_instance_id\" // empty")
+        #                 if [[ -n "$INSTANCE_ID" ]]; then
+        #                     echo "✅ Using instance ID from server mapping: $INSTANCE_ID"
+        #                 fi
+        #             fi
+
+        #             if [[ -z "$INSTANCE_ID" || "$INSTANCE_ID" == "null" ]]; then
+        #                 echo "⚙️ Server not provided or mapping not found, using task-type mapping for '$TASK_TYPE'"
+        #                 INSTANCE_ID=$(echo "$PARAM_JSON" | jq -r ".task_type_mappings.\"${TASK_TYPE}_instance_id\" // empty")
+        #             fi
+
+        #             if [[ -z "$INSTANCE_ID" || "$INSTANCE_ID" == "null" ]]; then
+        #                 echo "❌ No instance ID found for server '${SERVER:-none}' or task_type '${TASK_TYPE}'. Skipping."
+        #                 FAIL_LIST+="ConfigurationTransfer → ${SERVER:-unknown} (missing instance id)"$'\n'
+        #                 continue
+        #             fi
+
+        #             echo "📌 Running CT backup script on EC2 instance: $INSTANCE_ID"
+        #             CT_CMD_ID=$(aws ssm send-command \
+        #                 --document-name "AWS-RunShellScript" \
+        #                 --instance-ids "$INSTANCE_ID" \
+        #                 --region "$REGION" \
+        #                 --comment "Executing CT backup script" \
+        #                 --parameters "commands=[ 
+        #                 \"chmod +x /tmp/${JIRA_ID}/scripts/backup-ct.sh\",
+        #                 \"chmod +x /tmp/${JIRA_ID}/utilities/ConfigurationTransfer/CTC\",
+        #                 \"/tmp/${JIRA_ID}/scripts/backup-ct.sh $JIRA_ID $CTE_FILE $TEMPLATE_FILE $BUCKET_BASE $CT_DB_URL $ORACLE_USER $ORACLE_PASS $TASK_IDENTIFIER\" 
+        #                 ]" \
+        #                 --query "Command.CommandId" \
+        #                 --output text)
+
+        #             echo "📄 CT Command ID: $CT_CMD_ID"
+
+        #             # poll until complete
+        #             while true; do
+        #                 CT_STATUS=$(aws ssm list-command-invocations \
+        #                     --command-id "$CT_CMD_ID" \
+        #                     --region "$REGION" \
+        #                     --query "CommandInvocations[].Status" \
+        #                     --output text)
+
+        #                 echo "CT command status: $CT_STATUS"
+
+        #                 if [[ "$CT_STATUS" == "Success" || "$CT_STATUS" == "Failed" || "$CT_STATUS" == "TimedOut" || "$CT_STATUS" == "Cancelled" ]]; then
+        #                     echo "📜 Fetching detailed CT command output (stdout & stderr)..."
+        #                     aws ssm get-command-invocation \
+        #                         --command-id "$CT_CMD_ID" \
+        #                         --instance-id "$INSTANCE_ID" \
+        #                         --region "$REGION" \
+        #                         --query '{Status:Status, StandardOutputContent:StandardOutputContent, StandardErrorContent:StandardErrorContent}' \
+        #                         --output json > /tmp/ct_output_${SERVER}.json
+
+        #                     echo "🔎 ===== CT STDOUT (${SERVER}) ====="
+        #                     jq -r '.StandardOutputContent' /tmp/ct_output_${SERVER}.json
+
+        #                     echo "⚠️ ===== CT STDERR (${SERVER}) ====="
+        #                     jq -r '.StandardErrorContent' /tmp/ct_output_${SERVER}.json
+
+        #                 if [[ "$CT_STATUS" == "Success" ]]; then
+        #                     echo "✅ CT backup success: $SERVER"
+        #                     SUCCESS_LIST+="ConfigurationTransfer → ${SERVER} (${CTE_FILE})"$'\n'
+        #                     break
+        #                 elif [[ "$CT_STATUS" == "Failed" || "$CT_STATUS" == "TimedOut" || "$CT_STATUS" == "Cancelled" ]]; then
+        #                     echo "❌ CT backup failed for $SERVER. Status: $CT_STATUS"
+        #                     FAIL_LIST+="ConfigurationTransfer → ${SERVER} (${CTE_FILE})"$'\n'
+        #                     break
+        #                 else
+        #                     echo "⏳ CT command still running, waiting..."
+        #                     sleep 10
+        #                 fi
+        #             done
+        #         fi
+        #     done
+        # fi
+
+        #################################
+        # 5) CONFIGURATION TRANSFER (CT)
+        #################################
+        echo "📌 Starting Configuration Transfer backup process"
+
+        CT_TASKS_IN_JSON=$(jq '[.backup[] | select(.task_type | test("^ConfigurationTransfer"; "i"))] | length' task.json)
+
+        if [[ "$CT_TASKS_IN_JSON" -eq 0 ]]; then
+                echo "No ConfigurationTransfer entries found in task.json - skipping CT backup process"
+        else
+                echo "✅ Found $CT_TASKS_IN_JSON ConfigurationTransfer task(s) in task.json"
+                
+                for (( i=0; i<$(jq '.backup | length' task.json); i++ )); do
+                        UNFORMATTED_TASK_TYPE=$(jq -r ".backup[$i].task_type" task.json)
+                        TASK_TYPE=$(echo "$UNFORMATTED_TASK_TYPE" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z]//g')
+                        if [[ "$TASK_TYPE" == "configurationtransfer" ]]; then
+                                SERVER=$(jq -r ".backup[$i].server // empty" task.json)
+                                CTE_FILE=$(jq -r ".backup[$i].created_backup_file" task.json)
+                                TEMPLATE_FILE=$(jq -r ".backup[$i].template_file" task.json)
+                                TASK_IDENTIFIER="$UNFORMATTED_TASK_TYPE"
+
+                                # Determine DB_URL based on version (special case for RP-3.0)
+                                if [[ "$VERSION" == "RP-3.0" || "$VERSION" == "RP-3.1" ]]; then
+                                        CT_DB_URL="${DB_URL#jdbc:}"
+                                        echo "🔧 Version RP-3.0 / RP-3.1 detected — using modified DB URL (without 'jdbc:'): $CT_DB_URL"
+                                else
+                                        CT_DB_URL="$DB_URL"
+                                fi
+
+                                if [[ -n "$SERVER" ]]; then
+                                        echo "🔍 Looking up instance ID for server '$SERVER'..."
+                                        INSTANCE_ID=$(echo "$PARAM_JSON" | jq -r ".Instance_mappings.\"${SERVER}_instance_id\" // empty")
+                                        if [[ -n "$INSTANCE_ID" ]]; then
+                                                echo "✅ Using instance ID from server mapping: $INSTANCE_ID"
+                                        fi
+                                fi
+
+                                if [[ -z "$INSTANCE_ID" || "$INSTANCE_ID" == "null" ]]; then
+                                        echo "⚙️ Server not provided or mapping not found, using task-type mapping for '$TASK_TYPE'"
+                                        INSTANCE_ID=$(echo "$PARAM_JSON" | jq -r ".task_type_mappings.\"${TASK_TYPE}_instance_id\" // empty")
+                                fi
+
+                                if [[ -z "$INSTANCE_ID" || "$INSTANCE_ID" == "null" ]]; then
+                                        echo "❌ No instance ID found for server '${SERVER:-none}' or task_type '${TASK_TYPE}'. Skipping."
+                                        FAIL_LIST+="ConfigurationTransfer → ${SERVER:-unknown} (missing instance id)"$'\n'
+                                        continue
+                                fi
+
+                                echo "📌 Running CT backup script on EC2 instance: $INSTANCE_ID"
+                                CT_CMD_ID=$(aws ssm send-command \
+                                        --document-name "AWS-RunShellScript" \
+                                        --instance-ids "$INSTANCE_ID" \
+                                        --region "$REGION" \
+                                        --comment "Executing CT backup script" \
+                                        --parameters "commands=[ 
+                                        \"chmod +x /tmp/${JIRA_ID}/scripts/backup-ct.sh\",
+                                        \"chmod +x /tmp/${JIRA_ID}/utilities/ConfigurationTransfer/CTC\",
+                                        \"/tmp/${JIRA_ID}/scripts/backup-ct.sh $JIRA_ID $CTE_FILE $TEMPLATE_FILE $BUCKET_BASE $CT_DB_URL $ORACLE_USER $ORACLE_PASS $JAVA_PATH $TASK_IDENTIFIER\" 
+                                        ]" \
+                                        --query "Command.CommandId" \
+                                        --output text)
+
+                                echo "📄 CT Command ID: $CT_CMD_ID"
+
+                                # poll until complete
+                                while true; do
+                                        CT_STATUS=$(aws ssm list-command-invocations \
+                                                --command-id "$CT_CMD_ID" \
+                                                --region "$REGION" \
+                                                --query "CommandInvocations[].Status" \
+                                                --output text)
+
+                                        echo "CT command status: $CT_STATUS"
+
+                                        if [[ "$CT_STATUS" == "Success" || "$CT_STATUS" == "Failed" || "$CT_STATUS" == "TimedOut" || "$CT_STATUS" == "Cancelled" ]]; then
+                                                echo "📜 Fetching detailed CT command output (stdout & stderr)..."
+                                                aws ssm get-command-invocation \
+                                                        --command-id "$CT_CMD_ID" \
+                                                        --instance-id "$INSTANCE_ID" \
+                                                        --region "$REGION" \
+                                                        --query '{Status:Status, StandardOutputContent:StandardOutputContent, StandardErrorContent:StandardErrorContent}' \
+                                                        --output json > /tmp/ct_output_${SERVER}.json
+
+                                                echo "🔎 ===== CT STDOUT (${SERVER}) ====="
+                                                jq -r '.StandardOutputContent' /tmp/ct_output_${SERVER}.json
+
+                                                echo "⚠️ ===== CT STDERR (${SERVER}) ====="
+                                                jq -r '.StandardErrorContent' /tmp/ct_output_${SERVER}.json
+
+                                                if [[ "$CT_STATUS" == "Success" ]]; then
+                                                        echo "✅ CT backup success: $SERVER"
+                                                        SUCCESS_LIST+="ConfigurationTransfer → ${SERVER} (${CTE_FILE})"$'\n'
+                                                        break
+                                                elif [[ "$CT_STATUS" == "Failed" || "$CT_STATUS" == "TimedOut" || "$CT_STATUS" == "Cancelled" ]]; then
+                                                        echo "❌ CT backup failed for $SERVER. Status: $CT_STATUS"
+                                                        FAIL_LIST+="ConfigurationTransfer → ${SERVER} (${CTE_FILE})"$'\n'
+                                                        break
+                                                else
+                                                        echo "⏳ CT command still running, waiting..."
+                                                        sleep 10
+                                                fi
+                                        fi
+                                done
+                        fi
+                done
+        fi
+
+
+        # #################################
+        # # 6) TLM VIEW BACKUP
+        # #################################
+        # echo "📌 Starting TLM View backup process"
+
+        # TLM_TASKS_IN_JSON=$(jq '[.backup[] | select(.task_type | test("^TLMView"; "i"))] | length' task.json)
+
+        # if [[ "$TLM_TASKS_IN_JSON" -eq 0 ]]; then
+        #     echo "ℹ️ No TLMView entries found in task.json - skipping TLM View backup process"
+        # else
+        #     echo "✅ Found $TLM_TASKS_IN_JSON TLMView task(s) in task.json"
+            
+        #     for (( i=0; i<$(jq '.backup | length' task.json); i++ )); do
+        #         UNFORMATTED_TASK_TYPE=$(jq -r ".backup[$i].task_type" task.json)
+        #         TASK_TYPE=$(echo "$UNFORMATTED_TASK_TYPE" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z]//g')
+        #         if [[ "$TASK_TYPE" == "tlmview" ]]; then
+        #             SERVER=$(jq -r ".backup[$i].server // empty" task.json)
+        #             BLUEPRINT_FILE=$(jq -r ".backup[$i].blueprint_file" task.json)
+        #             CREATED_BACKUP_FILE=$(jq -r ".backup[$i].created_backup_file" task.json)
+        #             TASK_IDENTIFIER="$UNFORMATTED_TASK_TYPE"
+
+        #             if [[ -n "$SERVER" ]]; then
+        #                 echo "🔍 Looking up instance ID for server '$SERVER'..."
+        #                 INSTANCE_ID=$(echo "$PARAM_JSON" | jq -r ".Instance_mappings.\"${SERVER}_instance_id\" // empty")
+        #                 if [[ -n "$INSTANCE_ID" ]]; then
+        #                     echo "✅ Using instance ID from server mapping: $INSTANCE_ID"
+        #                 fi
+        #             fi
+
+        #             if [[ -z "$INSTANCE_ID" || "$INSTANCE_ID" == "null" ]]; then
+        #                 echo "⚙️ Server not provided or mapping not found, using task-type mapping for '$TASK_TYPE'"
+        #                 INSTANCE_ID=$(echo "$PARAM_JSON" | jq -r ".task_type_mappings.\"${TASK_TYPE}_instance_id\" // empty")
+        #             fi
+
+        #             if [[ -z "$INSTANCE_ID" || "$INSTANCE_ID" == "null" ]]; then
+        #                 echo "❌ No instance ID found for server '${SERVER:-none}' or task_type '${TASK_TYPE}'. Skipping."
+        #                 FAIL_LIST+="TLMView → ${SERVER:-unknown} (missing instance id)"$'\n'
+        #                 continue
+        #             fi
+
+        #             echo "📌 Running TLM View backup script on EC2 instance: $INSTANCE_ID"
+
+        #             TLM_CMD_ID=$(aws ssm send-command \
+        #                 --document-name "AWS-RunShellScript" \
+        #                 --instance-ids "$INSTANCE_ID" \
+        #                 --region "$REGION" \
+        #                 --comment "Executing TLM View backup script" \
+        #                 --parameters "commands=[
+        #                 \"chmod +x /tmp/${JIRA_ID}/scripts/backup-tlmview.sh\",
+        #                 \"/tmp/${JIRA_ID}/scripts/backup-tlmview.sh $JIRA_ID $BLUEPRINT_FILE $CREATED_BACKUP_FILE $BUCKET_BASE $DB_URL $ORACLE_USER $ORACLE_PASS $JAVA_PATH $TASK_IDENTIFIER\"
+        #                 ]" \
+        #                 --query "Command.CommandId" \
+        #                 --output text)
+
+        #             echo "📄 TLM View Command ID: $TLM_CMD_ID"
+
+        #             # Poll until complete
+        #             while true; do
+        #                 TLM_STATUS=$(aws ssm list-command-invocations \
+        #                     --command-id "$TLM_CMD_ID" \
+        #                     --region "$REGION" \
+        #                     --query "CommandInvocations[].Status" \
+        #                     --output text)
+
+        #                 echo "TLM View command status: $TLM_STATUS"
+
+        #                 if [[ "$TLM_STATUS" == "Success" ]]; then
+        #                     echo "✅ TLM View backup success: $SERVER"
+        #                     SUCCESS_LIST+="TLMView → ${SERVER} (${CREATED_BACKUP_FILE})"$'\n'
+        #                     break
+        #                 elif [[ "$TLM_STATUS" == "Failed" || "$TLM_STATUS" == "TimedOut" || "$TLM_STATUS" == "Cancelled" ]]; then
+        #                     echo "❌ TLM View backup failed for $SERVER. Status: $TLM_STATUS"
+        #                     FAIL_LIST+="TLMView → ${SERVER} (${CREATED_BACKUP_FILE})"$'\n'
+        #                     break
+        #                 else
+        #                     echo "⏳ TLM View command still running, waiting..."
+        #                     sleep 10
+        #                 fi
+        #             done
+        #         fi
+        #     done
+        # fi
+
+        #################################
+        # 6) TLM VIEW BACKUP
+        #################################
+        echo "📌 Starting TLM View backup process"
+
+        TLM_TASKS_IN_JSON=$(jq '[.backup[] | select(.task_type | test("^TLMView"; "i"))] | length' task.json)
+
+        if [[ "$TLM_TASKS_IN_JSON" -eq 0 ]]; then
+            echo "ℹ️ No TLMView entries found in task.json - skipping TLM View backup process"
+        else
+            echo "✅ Found $TLM_TASKS_IN_JSON TLMView task(s) in task.json"
+            
+            for (( i=0; i<$(jq '.backup | length' task.json); i++ )); do
+                UNFORMATTED_TASK_TYPE=$(jq -r ".backup[$i].task_type" task.json)
+                TASK_TYPE=$(echo "$UNFORMATTED_TASK_TYPE" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z]//g')
+                if [[ "$TASK_TYPE" == "tlmview" ]]; then
+                    SERVER=$(jq -r ".backup[$i].server // empty" task.json)
+                    BLUEPRINT_FILE=$(jq -r ".backup[$i].blueprint_file" task.json)
+                    CREATED_BACKUP_FILE=$(jq -r ".backup[$i].created_backup_file" task.json)
+                    TASK_IDENTIFIER="$UNFORMATTED_TASK_TYPE"
+
+                    if [[ -n "$SERVER" ]]; then
+                        echo "🔍 Looking up instance ID for server '$SERVER'..."
+                        INSTANCE_ID=$(echo "$PARAM_JSON" | jq -r ".Instance_mappings.\"${SERVER}_instance_id\" // empty")
+                        if [[ -n "$INSTANCE_ID" ]]; then
+                            echo "✅ Using instance ID from server mapping: $INSTANCE_ID"
+                        fi
+                    fi
+
+                    if [[ -z "$INSTANCE_ID" || "$INSTANCE_ID" == "null" ]]; then
+                        echo "⚙️ Server not provided or mapping not found, using task-type mapping for '$TASK_TYPE'"
+                        INSTANCE_ID=$(echo "$PARAM_JSON" | jq -r ".task_type_mappings.\"${TASK_TYPE}_instance_id\" // empty")
+                    fi
+
+                    if [[ -z "$INSTANCE_ID" || "$INSTANCE_ID" == "null" ]]; then
+                        echo "❌ No instance ID found for server '${SERVER:-none}' or task_type '${TASK_TYPE}'. Skipping."
+                        FAIL_LIST+="TLMView → ${SERVER:-unknown} (missing instance id)"$'\n'
+                        continue
+                    fi
+
+                    echo "📌 Running TLM View backup script on EC2 instance: $INSTANCE_ID"
+
+                    TLM_CMD_ID=$(aws ssm send-command \
+                        --document-name "AWS-RunShellScript" \
+                        --instance-ids "$INSTANCE_ID" \
+                        --region "$REGION" \
+                        --comment "Executing TLM View backup script" \
+                        --parameters "commands=[
+                        \"chmod +x /tmp/${JIRA_ID}/scripts/backup-tlmview.sh\",
+                        \"/tmp/${JIRA_ID}/scripts/backup-tlmview.sh $JIRA_ID $BLUEPRINT_FILE $CREATED_BACKUP_FILE $BUCKET_BASE $DB_URL $ORACLE_USER $ORACLE_PASS $JAVA_PATH $TASK_IDENTIFIER\"
+                        ]" \
+                        --query "Command.CommandId" \
+                        --output text)
+
+                    echo "📄 TLM View Command ID: $TLM_CMD_ID"
+
+                    # Poll until complete and capture stdout/stderr
+                    while true; do
+                        TLM_STATUS=$(aws ssm list-command-invocations \
+                            --command-id "$TLM_CMD_ID" \
+                            --region "$REGION" \
+                            --query "CommandInvocations[].Status" \
+                            --output text)
+
+                        echo "TLM View command status: $TLM_STATUS"
+
+                        if [[ "$TLM_STATUS" == "Success" || "$TLM_STATUS" == "Failed" || "$TLM_STATUS" == "TimedOut" || "$TLM_STATUS" == "Cancelled" ]]; then
+                            echo "📜 Fetching detailed TLM View command output (stdout & stderr)..."
+                            aws ssm get-command-invocation \
+                                --command-id "$TLM_CMD_ID" \
+                                --instance-id "$INSTANCE_ID" \
+                                --region "$REGION" \
+                                --query '{Status:Status, StandardOutputContent:StandardOutputContent, StandardErrorContent:StandardErrorContent}' \
+                                --output json > /tmp/tlm_output_${SERVER}.json
+
+                            echo "🔎 ===== TLM View STDOUT (${SERVER}) ====="
+                            jq -r '.StandardOutputContent' /tmp/tlm_output_${SERVER}.json
+
+                            echo "⚠️ ===== TLM View STDERR (${SERVER}) ====="
+                            jq -r '.StandardErrorContent' /tmp/tlm_output_${SERVER}.json
+
+                            if [[ "$TLM_STATUS" == "Success" ]]; then
+                                echo "✅ TLM View backup success: $SERVER"
+                                SUCCESS_LIST+="TLMView → ${SERVER} (${CREATED_BACKUP_FILE})"$'\n'
+                                break
+                            else
+                                echo "❌ TLM View backup failed for $SERVER. Status: $TLM_STATUS"
+                                FAIL_LIST+="TLMView → ${SERVER} (${CREATED_BACKUP_FILE})"$'\n'
+                                break
+                            fi
+                        else
+                            echo "⏳ TLM View command still running, waiting..."
+                            sleep 10
+                        fi
+                    done
+                fi
+            done
+        fi
+
+        # #################################
+        # # 7) STATIC BACKUP
+        # #################################
+        # echo "📌 Checking deploy tasks for Static backup"
+        # STATIC_FOUND=false
+        # for (( i=0; i<$(jq '.deploy | length' task.json); i++ )); do
+        #   DEPLOY_TASK_TYPE=$(jq -r ".deploy[$i].task_type" task.json)
+        #   SERVER=$(jq -r ".deploy[$i].server // empty" task.json)
+        #   NORMALIZED_TYPE=$(echo "$DEPLOY_TASK_TYPE" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
+        #   if [[ "$NORMALIZED_TYPE" =~ ^static ]]; then
+        #     STATIC_FOUND=true
+        #     break
+        #   fi
+        # done
+
+        # if [[ "$STATIC_FOUND" == true ]]; then
+        #   echo "✅ Found 'static' task in deploy array — starting Static backup process"
+
+        #   if [[ -n "$SERVER" ]]; then
+        #     echo "🔍 Looking up instance ID for server '$SERVER'..."
+        #     INSTANCE_ID=$(echo "$PARAM_JSON" | jq -r ".Instance_mappings.\"${SERVER}_instance_id\" // empty")
+        #     if [[ -n "$INSTANCE_ID" ]]; then
+        #       echo "✅ Using instance ID from server mapping: $INSTANCE_ID"
+        #     fi
+        #   fi
+
+        #   if [[ -z "$INSTANCE_ID" || "$INSTANCE_ID" == "null" ]]; then
+        #     echo "⚙️ Server not provided or mapping not found, using task-type mapping for '$TASK_TYPE'"
+        #     INSTANCE_ID=$(echo "$PARAM_JSON" | jq -r ".task_type_mappings.\"${TASK_TYPE}_instance_id\" // empty")
+        #   fi
+
+        #   if [[ -z "$INSTANCE_ID" || "$INSTANCE_ID" == "null" ]]; then
+        #     echo "❌ No instance ID found for server '${SERVER:-none}' or task_type '${TASK_TYPE}'. Skipping."
+        #     FAIL_LIST+="Static → ${SERVER:-unknown} (missing instance id)"$'\n'
+        #     continue
+        #   fi
+
+        #   echo "🚀 Initiating Static Oracle backup via SSM"
+
+        #   COMMAND_ID=$(aws ssm send-command \
+        #     --document-name "AWS-RunShellScript" \
+        #     --instance-ids "$INSTANCE_ID" \
+        #     --region "$REGION" \
+        #     --comment "Trigger Static Oracle table backup" \
+        #     --parameters "commands=[
+        #       \"chmod +x /tmp/${JIRA_ID}/scripts/backup-static.sh\",
+        #       \"/tmp/${JIRA_ID}/scripts/backup-static.sh $ORACLE_HOST $ORACLE_PORT $ORACLE_SID $ORACLE_USER $ORACLE_PASS $ORACLE_PATH $JIRA_ID\"
+        #     ]" \
+        #     --query "Command.CommandId" \
+        #     --output text)
+
+        #   echo "Command ID: $COMMAND_ID. Waiting for completion..."
+
+        #   while true; do
+        #     COMMAND_STATUS=$(aws ssm list-command-invocations \
+        #       --command-id "$COMMAND_ID" \
+        #       --region "$REGION" \
+        #       --query "CommandInvocations[].Status" \
+        #       --output text)
+
+        #     echo "Command status: $COMMAND_STATUS"
+
+        #     if [[ "$COMMAND_STATUS" == "Success" ]]; then
+        #       echo "✅ Static Oracle table backup completed successfully."
+        #       SUCCESS_LIST+="Static → Backup successful"$'\n'
+        #       break
+
+        #     elif [[ "$COMMAND_STATUS" == "Failed" || "$COMMAND_STATUS" == "TimedOut" || "$COMMAND_STATUS" == "Cancelled" ]]; then
+        #       echo "❌ Static Oracle backup failed or was cancelled. Status: $COMMAND_STATUS"
+        #       FAIL_LIST+="Static → Backup failed (Status: $COMMAND_STATUS)"$'\n'
+        #       break
+
+        #     elif [[ "$COMMAND_STATUS" == "Pending" || "$COMMAND_STATUS" == "InProgress" ]]; then
+        #       echo "⏳ Command in progress... waiting"
+        #       sleep 10
+
+        #     else
+        #       echo "⚠️ Unexpected status: $COMMAND_STATUS"
+        #       FAIL_LIST+="Static → Unexpected status ($COMMAND_STATUS)"$'\n'
+        #       break
+        #     fi
+        #   done
+        # else
+        #   echo "No 'static' task found in deploy array — skipping Static backup."
+        # fi
+
+        #################################
+        # 7) STATIC BACKUP
+        #################################
+        echo "📌 Checking deploy tasks for Static backup"
+
+        # Find first matching static task index
+        STATIC_INDEX=$(jq -r \
+            '(.deploy | to_entries | map(select(.value.task_type | test("^static"; "i"))) | .[0].key) // "-1"' \
+            task.json)
+
+        if [[ "$STATIC_INDEX" -eq -1 ]]; then
+            echo "ℹ️ No Static entries found in deploy array - skipping Static backup process"
+        else
+            echo "✅ Found Static task in deploy array — starting Static backup process"
+
+            RAW_TASK_TYPE=$(jq -r ".deploy[$STATIC_INDEX].task_type" task.json)
+            TASK_TYPE=$(echo "$RAW_TASK_TYPE" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z]//g')
+            SERVER=$(jq -r ".deploy[$STATIC_INDEX].server // empty" task.json)
+
+            # Instance resolution
+            if [[ -n "$SERVER" ]]; then
+                echo "🔍 Looking up instance ID for server '$SERVER'..."
+                INSTANCE_ID=$(echo "$PARAM_JSON" | jq -r ".Instance_mappings.\"${SERVER}_instance_id\" // empty")
+                if [[ -n "$INSTANCE_ID" ]]; then
+                    echo "✅ Using instance ID from server mapping: $INSTANCE_ID"
+                fi
+            fi
+
+            if [[ -z "$INSTANCE_ID" || "$INSTANCE_ID" == "null" ]]; then
+                echo "⚙️ Server not provided or mapping not found, using task-type mapping for '$TASK_TYPE'"
+                INSTANCE_ID=$(echo "$PARAM_JSON" \
+                    | jq -r ".task_type_mappings.\"${TASK_TYPE}_instance_id\" // empty")
+            fi
+
+            if [[ -z "$INSTANCE_ID" || "$INSTANCE_ID" == "null" ]]; then
+                echo "❌ No instance ID found for server '${SERVER:-none}' or task_type '${TASK_TYPE}'. Skipping."
+                FAIL_LIST+="Static → ${SERVER:-unknown} (missing instance id)"$'\n'
+                return
+            fi
+
+            echo "📌 Running Static Oracle backup script on EC2 instance: $INSTANCE_ID"
+
+            STATIC_CMD_ID=$(aws ssm send-command \
+                --document-name "AWS-RunShellScript" \
+                --instance-ids "$INSTANCE_ID" \
+                --region "$REGION" \
+                --comment "Executing Static Oracle backup" \
+                --parameters "commands=[
+                    \"chmod +x /tmp/${JIRA_ID}/scripts/backup-static.sh\",
+                    \"/tmp/${JIRA_ID}/scripts/backup-static.sh $ORACLE_HOST $ORACLE_PORT $ORACLE_SID $ORACLE_USER $ORACLE_PASS $ORACLE_PATH $JIRA_ID\"
+                ]" \
+                --query "Command.CommandId" \
+                --output text)
+
+            echo "📄 Static Command ID: $STATIC_CMD_ID"
+
+            # Poll until completion and fetch stdout + stderr
+            while true; do
+                STATIC_STATUS=$(aws ssm list-command-invocations \
+                    --command-id "$STATIC_CMD_ID" \
+                    --region "$REGION" \
+                    --query "CommandInvocations[].Status" \
+                    --output text)
+
+                echo "Static backup command status: $STATIC_STATUS"
+
+                if [[ "$STATIC_STATUS" == "Success" || "$STATIC_STATUS" == "Failed" || "$STATIC_STATUS" == "TimedOut" || "$STATIC_STATUS" == "Cancelled" ]]; then
+                    echo "📜 Fetching detailed Static backup output (stdout & stderr)..."
+
+                    aws ssm get-command-invocation \
+                        --command-id "$STATIC_CMD_ID" \
+                        --instance-id "$INSTANCE_ID" \
+                        --region "$REGION" \
+                        --query '{Status:Status, StandardOutputContent:StandardOutputContent, StandardErrorContent:StandardErrorContent}' \
+                        --output json > /tmp/static_output_${SERVER}.json
+
+                    echo "🔎 ===== Static STDOUT (${SERVER}) ====="
+                    jq -r '.StandardOutputContent' /tmp/static_output_${SERVER}.json
+
+                    echo "⚠️ ===== Static STDERR (${SERVER}) ====="
+                    jq -r '.StandardErrorContent' /tmp/static_output_${SERVER}.json
+
+                    if [[ "$STATIC_STATUS" == "Success" ]]; then
+                        echo "✅ Static Oracle backup success: $SERVER"
+                        SUCCESS_LIST+="Static → ${SERVER} (backup successful)"$'\n'
+                    else
+                        echo "❌ Static Oracle backup failed for $SERVER. Status: $STATIC_STATUS"
+                        FAIL_LIST+="Static → ${SERVER} (backup failed)"$'\n'
+                    fi
+
+                    break
+                else
+                    echo "⏳ Static backup command still running, waiting..."
+                    sleep 10
+                fi
+            done
+        fi
+
+        #################################
+        # 4) SYNTAX-CT BACKUPS
+        #################################
+        echo "🔧 Executing SYNTAX-CT backups..."
+
+        # Debug: print raw task.json size and head
+        echo "📂 task.json size: $(stat -c%s task.json) bytes"
+        echo "📄 task.json preview (first 10 lines):"
+        head -n 10 task.json
+
+        SYNTAXCT_TASKS_IN_JSON=$(jq '[.backup[] | select(.task_type | test("^Syntax-CT"; "i"))] | length' task.json 2>jq_error.log) || {
+          echo "❌ jq failed when reading syntax-ct tasks: $(cat jq_error.log)"
+          exit 1
+        }
+        echo "✅ Found $SYNTAXCT_TASKS_IN_JSON syntax-ct backup entries"
+
+        if [[ "$SYNTAXCT_TASKS_IN_JSON" -eq 0 ]]; then
+          echo "ℹ️ No Syntax-CT backup entries found in task.json - skipping SYNTAX-CT backup process"
+        else
+          echo "🔧 Executing SYNTAX-CT backups..."
+
+          # Read syntax_ct_details from parameter store
+          SYNTAX_ENV_ID=$(echo "$PARAM_JSON" | jq -r '.syntax_ct_details.env_id')
+          SYNTAX_ENV_NAME=$(echo "$PARAM_JSON" | jq -r '.syntax_ct_details.env_name')
+          SYNTAX_OBJ_VERSION=$(echo "$PARAM_JSON" | jq -r '.syntax_ct_details.obj_version')
+          SYNTAX_JAVA_PATH=$(echo "$PARAM_JSON" | jq -r '.syntax_ct_details.java_path')
+
+          echo "🔍 Read syntax_ct_details: env_id=${SYNTAX_ENV_ID:-null}, env_name=${SYNTAX_ENV_NAME:-null}, obj_version=${SYNTAX_OBJ_VERSION:-null}, java_path=${SYNTAX_JAVA_PATH:-null}"
+
+          # Normalize "null" to empty
+          [[ "$SYNTAX_ENV_ID" == "null" ]] && SYNTAX_ENV_ID=""
+          [[ "$SYNTAX_ENV_NAME" == "null" ]] && SYNTAX_ENV_NAME=""
+          [[ "$SYNTAX_OBJ_VERSION" == "null" ]] && SYNTAX_OBJ_VERSION=""
+          [[ "$SYNTAX_JAVA_PATH" == "null" ]] && SYNTAX_JAVA_PATH=""
+
+          if [[ -z "$SYNTAX_ENV_ID" || -z "$SYNTAX_ENV_NAME" || -z "$SYNTAX_OBJ_VERSION" || -z "$SYNTAX_JAVA_PATH" ]]; then
+            echo "⚠️ One or more syntax_ct_details keys missing in Parameter Store. SYNTAX-CT backups may fail."
+          else
+            echo "✅ syntax_ct_details present (env details and java path loaded)"
+          fi
+
+          # Debug: print the jq raw output filtered for Syntax-CT tasks before looping
+          echo "📋 jq filtered Syntax-CT backup tasks (compact):"
+          if ! jq -c '.backup[] | select(.task_type | test("^Syntax-CT"; "i"))' task.json > syntaxct_tasks.json 2>jq_loop_error.log; then
+            echo "❌ jq failed filtering syntax-ct backup tasks: $(cat jq_loop_error.log)"
+            exit 1
+          fi
+          cat syntaxct_tasks.json
+
+          # Iterate through Syntax-CT tasks
+          jq -c '.backup[] | select(.task_type | test("^Syntax-CT"; "i"))' task.json | while IFS= read -r ROW; do
+            echo "🧾 Processing raw syntax-ct task row: $ROW"
+
+            TASK_TYPE=$(echo "$ROW" | jq -r '.task_type')
+            SYNTAX_TO_BACKUP=$(echo "$ROW" | jq -r '.syntax_to_backup')
+            SERVER_NAME=$(echo "$ROW" | jq -r '(.server // .server_name)')
+
+            echo "➡️ SYNTAX-CT task: ${TASK_TYPE} syntax_to_backup='${SYNTAX_TO_BACKUP}' server='${SERVER_NAME}'"
+
+            if [[ -z "${SYNTAX_TO_BACKUP}" ]]; then
+              echo "❌ Missing syntax_to_backup for ${TASK_TYPE} — skipping"
+              FAIL_LIST+="SYNTAX-CT → ${TASK_TYPE} (missing syntax_to_backup)"$'\n'
+              continue
+            fi
+
+            # Map syntax-ct server instance id
+            SYNTAX_KEY="$(echo "$SERVER_NAME" | tr '[:upper:]' '[:lower:]')_instance_id"
+            SYNTAX_IID=$(echo "$PARAM_JSON" | jq -r --arg k "$SYNTAX_KEY" '.Instance_mappings[$k]')
+
+            if [[ -z "${SYNTAX_IID}" || "${SYNTAX_IID}" == "null" ]]; then
+              # fallback: task_type mapping (optional)
+              SYNTAX_IID=$(echo "$PARAM_JSON" | jq -r '.task_type_mappings.syntax_ct_instance_id')
+            fi
+
+            if [[ -z "${SYNTAX_IID}" || "${SYNTAX_IID}" == "null" ]]; then
+              echo "❌ No instance mapping for SYNTAX-CT server '${SERVER_NAME}' (key=${SYNTAX_KEY})"
+              FAIL_LIST+="SYNTAX-CT → ${TASK_TYPE} (${SYNTAX_TO_BACKUP}) (no instance mapping)"$'\n'
+              continue
+            fi
+
+            # Prepare S3 upload path and safe syntax name
+            S3_SYNTAXCT_UPLOAD="${BUCKET_BASE%/}/${JIRA_ID}/Syntax-CT"
+            SAFE_SYNTAX=$(echo "${SYNTAX_TO_BACKUP}" | sed 's/ /_/g')
+            echo "🧪 Safe syntax name: $SAFE_SYNTAX"
+
+            # Build commands_syntaxct_exec.json using template
+            cat > commands_syntaxct_exec.json <<'JSON_TPL'
+        {
+          "commands": [
+            "set -euo pipefail",
+            "mkdir -p /tmp/__JIRA__/syntax-ct",
+            "UTIL_SUB=$(ls -1 /tmp/__JIRA__/utilities/syntax-ct/installer/ 2>/dev/null | grep -E '^installer' | head -n1 || true)",
+            "if [[ -n \"$UTIL_SUB\" ]]; then UTIL_PATH=\"/tmp/__JIRA__/utilities/syntax-ct/installer/$UTIL_SUB\"; else UTIL_PATH=\"/tmp/__JIRA__/utilities/syntax-ct/installer\"; fi",
+            "BACKUP_FILE=/tmp/__JIRA__/syntax-ct/__SYNTAX____JIRA__.cte",
+            "echo \"Using UTIL_PATH=$UTIL_PATH BACKUP_FILE=$BACKUP_FILE\"",
+            "chmod -R 775 \"$UTIL_PATH\"",
+            "/tmp/__JIRA__/scripts/backup-syntaxctexport.sh \"$UTIL_PATH\" \"$BACKUP_FILE\" \"__ENV_ID__\" \"__ENV_NAME__\" \"__OBJ_VER__\" \"__SYNTAX_NAME__\" \"__JAVA_PATH__\"",
+            "if [[ -f \"$BACKUP_FILE\" ]]; then /usr/local/bin/aws s3 cp \"$BACKUP_FILE\" \"__S3UP__/\" --region __REG__; echo \"✅ Uploaded syntax-ct backup to s3\"; else echo \"⚠️ Syntax-CT backup file not created: $BACKUP_FILE\"; exit 3; fi"
+          ]
+        }
+        JSON_TPL
+
+            # placeholder replacement
+            sed -e "s|__JIRA__|${JIRA_ID}|g" \
+                -e "s|__SYNTAX__|${SAFE_SYNTAX}|g" \
+                -e "s|__ENV_ID__|${SYNTAX_ENV_ID}|g" \
+                -e "s|__ENV_NAME__|${SYNTAX_ENV_NAME}|g" \
+                -e "s|__OBJ_VER__|${SYNTAX_OBJ_VERSION}|g" \
+                -e "s|__SYNTAX_NAME__|${SYNTAX_TO_BACKUP}|g" \
+                -e "s|__JAVA_PATH__|${SYNTAX_JAVA_PATH}|g" \
+                -e "s|__S3UP__|${S3_SYNTAXCT_UPLOAD}|g" \
+                -e "s|__REG__|${REGION}|g" \
+                commands_syntaxct_exec.json > commands_syntaxct_exec.json.tmp && mv commands_syntaxct_exec.json.tmp commands_syntaxct_exec.json
+
+            # -------------------------
+            # Debug & validation steps
+            # -------------------------
+            echo
+            echo "🔍 Debug: driver variables:"
+            echo "  JIRA_ID: ${JIRA_ID}"
+            echo "  SYNTAX_TO_BACKUP: ${SYNTAX_TO_BACKUP}"
+            echo "  SYNTAX_IID: ${SYNTAX_IID}"
+            echo "  SYNTAX_ENV_ID: ${SYNTAX_ENV_ID}"
+            echo "  SYNTAX_ENV_NAME: ${SYNTAX_ENV_NAME}"
+            echo "  SYNTAX_OBJ_VERSION: ${SYNTAX_OBJ_VERSION}"
+            echo "  S3_SYNTAXCT_UPLOAD: ${S3_SYNTAXCT_UPLOAD}"
+            echo "  REGION: ${REGION}"
+            echo
+
+            echo "🔎 Debug: validate generated commands_syntaxct_exec.json is valid JSON (jq -e)"
+            if ! jq -e . commands_syntaxct_exec.json >/dev/null 2>&1; then
+              echo "❌ commands_syntaxct_exec.json is NOT valid JSON. Preview:"
+              cat commands_syntaxct_exec.json || true
+              FAIL_LIST+="SYNTAX-CT → ${TASK_TYPE} (${SYNTAX_TO_BACKUP}) (invalid JSON template)"$'\n'
+              continue
+            else
+              echo "✅ commands_syntaxct_exec.json is valid JSON"
+            fi
+
+            echo
+            echo "📋 Debug: commands_syntaxct_exec.json content (raw):"
+            sed -n '1,200p' commands_syntaxct_exec.json || true
+            echo
+
+            # Print individual commands (numbered)
+            echo "🔢 Debug: listing commands to be executed on the instance:"
+            jq -r '.commands[]' commands_syntaxct_exec.json | nl -ba | while IFS= read -r line; do
+              printf '%s\n' "$line"
+            done
+            echo
+
+            # Extract the syntax-ct export command
+            SYNTAX_CMD=$(jq -r '.commands[] | select(test("backup-syntaxctexport.sh"))' commands_syntaxct_exec.json 2>/dev/null || true)
+            if [[ -n "$SYNTAX_CMD" ]]; then
+              echo "⚙️ Debug: final syntax-ct export command that will be sent to instance:"
+              printf '%s\n' "$SYNTAX_CMD"
+              echo
+            else
+              echo "⚠️ Debug: syntax-ct export command not found in commands_syntaxct_exec.json"
+            fi
+
+            # Print aws ssm invocation preview
+            echo "📨 Debug: aws ssm send-command invocation (will use file://commands_syntaxct_exec.json):"
+            echo "aws ssm send-command --document-name AWS-RunShellScript --instance-ids \"${SYNTAX_IID}\" --comment \"syntax-ct export for ${SYNTAX_TO_BACKUP}\" --parameters file://commands_syntaxct_exec.json --region \"${REGION}\""
+            echo
+
+            # Send SSM command
+            echo "📨 Sending SSM command to instance ${SYNTAX_IID}..."
+            SYNTAX_CMD_ID=$(aws ssm send-command \
+              --document-name "AWS-RunShellScript" \
+              --instance-ids "${SYNTAX_IID}" \
+              --comment "syntax-ct export for ${SYNTAX_TO_BACKUP}" \
+              --parameters file://commands_syntaxct_exec.json \
+              --region "${REGION}" \
+              --query 'Command.CommandId' --output text) || true
+
+            if [[ -z "$SYNTAX_CMD_ID" || "$SYNTAX_CMD_ID" == "None" ]]; then
+              echo "❌ Failed to send syntax-ct export command to ${SYNTAX_IID} (aws ssm send-command returned empty/None)"
+              echo "📋 Preview of commands_syntaxct_exec.json (raw):"
+              cat commands_syntaxct_exec.json || true
+              FAIL_LIST+="SYNTAX-CT → ${TASK_TYPE} (${SYNTAX_TO_BACKUP}) (syntax-ct export send failed)"$'\n'
+              continue
+            fi
+
+            echo "⏳ Waiting for syntax-ct export command (${SYNTAX_CMD_ID}) on ${SYNTAX_IID}..."
+            if ! aws ssm wait command-executed --command-id "${SYNTAX_CMD_ID}" --instance-id "${SYNTAX_IID}" --region "${REGION}"; then
+              echo "❌ SSM waiter reported failure for syntax-ct export (CommandId=${SYNTAX_CMD_ID})"
+            fi
+
+            # Safely fetch invocation output (capture raw)
+            RAW_OUT_SYNTAX=$(aws ssm get-command-invocation --command-id "${SYNTAX_CMD_ID}" --instance-id "${SYNTAX_IID}" --region "${REGION}" --output json 2>/dev/null || true)
+
+            # If RAW_OUT_SYNTAX is empty, try to print an error and continue
+            if [[ -z "${RAW_OUT_SYNTAX}" ]]; then
+              echo "❌ Failed to fetch command invocation for CommandId=${SYNTAX_CMD_ID} Instance=${SYNTAX_IID}"
+              FAIL_LIST+="SYNTAX-CT → ${TASK_TYPE} (${SYNTAX_TO_BACKUP}) (no invocation output)"$'\n'
+              continue
+            fi
+
+            # Validate that RAW_OUT_SYNTAX is valid JSON before using jq
+            if ! printf '%s' "${RAW_OUT_SYNTAX}" | jq -e . >/dev/null 2>&1; then
+              echo "⚠️ get-command-invocation returned non-JSON or unexpected shape. Raw output:"
+              printf '%s\n' "${RAW_OUT_SYNTAX}"
+              # attempt to extract useful fields with grep as fallback
+              echo
+              echo "---- fallback raw output (grep) ----"
+              printf '%s\n' "${RAW_OUT_SYNTAX}" | sed -n '1,200p'
+              FAIL_LIST+="SYNTAX-CT → ${TASK_TYPE} (${SYNTAX_TO_BACKUP}) (invocation not JSON)"$'\n'
+              continue
+            fi
+
+            # Now safely parse JSON fields
+            SYNTAX_STATUS=$(printf '%s' "${RAW_OUT_SYNTAX}" | jq -r '.Status // empty')
+            SYNTAX_STDOUT=$(printf '%s' "${RAW_OUT_SYNTAX}" | jq -r '.StandardOutputContent // ""')
+            SYNTAX_STDERR=$(printf '%s' "${RAW_OUT_SYNTAX}" | jq -r '.StandardErrorContent // ""')
+
+            echo "📄 syntax-ct export Status: ${SYNTAX_STATUS}"
+            echo "📤 syntax-ct export Output:"
+            printf '%s\n' "${SYNTAX_STDOUT}"
+            if [[ -n "${SYNTAX_STDERR}" ]]; then
+              echo "🪵 syntax-ct export Stderr:"
+              printf '%s\n' "${SYNTAX_STDERR}"
+            fi
+
+            if [[ "${SYNTAX_STATUS}" == "Success" ]]; then
+              echo "✅ SYNTAX-CT backup for syntax '${SYNTAX_TO_BACKUP}' succeeded"
+              SUCCESS_LIST+="SYNTAX-CT → ${TASK_TYPE} (${SYNTAX_TO_BACKUP})"$'\n'
+            else
+              echo "❌ SYNTAX-CT backup for syntax '${SYNTAX_TO_BACKUP}' failed"
+              FAIL_LIST+="SYNTAX-CT → ${TASK_TYPE} (${SYNTAX_TO_BACKUP})"$'\n'
+            fi
+          done
+        fi
+
+        #################################
+        # 4) SUMMARY
+        #################################
+        echo ""
+        echo "📊 🔚 Backup Summary:"
+        echo "-----------------------"
+        echo "✅ Success:"
+        echo -e "${SUCCESS_LIST:-<none>}"
+        echo "❌ Failed:"
+        echo -e "${FAIL_LIST:-<none>}"
+        echo "-------------------------"
+        echo "✅ Backup execution phase complete"
+
+
+  post_build:
+    commands:
+      - |
+        echo "Resetting AWS credentials to CodeBuild role..."
+
+        unset AWS_ACCESS_KEY_ID
+        unset AWS_SECRET_ACCESS_KEY
+        unset AWS_SESSION_TOKEN
+                
+        exec > >(stdbuf -oL tee -a /tmp/build.log) 2>&1
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [POST_BUILD] UPLOADING_LOGS"
+        S3_PATH="s3://nonprod-release-management-codebuild-logs/pipeline-logs/$PIPELINE_EXECUTION_ID/$STAGE_NAME/build.log"
+        aws s3 cp /tmp/build.log "$S3_PATH"
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [POST_BUILD] LOGS_UPLOADED_TO=$S3_PATH"
+
+
+artifacts:
+  files:
+    - '**/*'

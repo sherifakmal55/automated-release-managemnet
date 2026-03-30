@@ -1,0 +1,108 @@
+version: 0.2
+
+env:
+  shell: bash
+  variables:
+    STAGE_BUCKET: "release-management-client-packages"
+    DEST_BUCKET: "smartstream-environment-file-transfer-bucket"
+    STAGE_PREFIX: "stage-client-packages"
+    DEST_PREFIX: "release-management/client-packages"
+    LOG_BUCKET: "nonprod-release-management-codebuild-logs"
+
+phases:
+  install:
+    commands:
+      - |
+        exec > >(stdbuf -oL tee -a /tmp/build.log) 2>&1
+
+        echo "🚀 [INSTALL] Started at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "📦 Installing jq..."
+        yum install -y jq || true
+
+        echo "🧾 PIPELINE_EXECUTION_ID=$PIPELINE_EXECUTION_ID"
+        echo "📍 STAGE_NAME=$STAGE_NAME"
+
+        echo "✅ [INSTALL] Completed"
+
+  build:
+    commands:
+      - |
+        echo "🚀 [PRE_BUILD] Started"
+
+        echo "📥 Reading task.json..."
+        cp $CODEBUILD_SRC_DIR_ValidatedOutput/task.json task.json
+        cat task.json
+
+        echo "🔍 Extracting values..."
+        JIRA=$(jq -r '.jira_ticket' task.json)
+        ENV=$(jq -r '.env' task.json)
+
+        if [ -z "$JIRA" ] || [ "$JIRA" = "null" ]; then
+          echo "❌ ERROR: jira_ticket missing"
+          exit 1
+        fi
+
+        if [ -z "$ENV" ] || [ "$ENV" = "null" ]; then
+          echo "❌ ERROR: env missing"
+          exit 1
+        fi
+
+        ZIP_FILE="${JIRA}.zip"
+
+        echo "🎫 JIRA=$JIRA"
+        echo "🌍 ENV=$ENV"
+        echo "📦 ZIP_FILE=$ZIP_FILE"
+
+        echo "✅ [PRE_BUILD] Completed"
+
+
+        echo "🚀 [BUILD] Started"
+
+        echo "🔎 Checking destination bucket..."
+        SKIP_COPY=false
+
+        if aws s3 ls s3://$DEST_BUCKET/$DEST_PREFIX/$ZIP_FILE >/dev/null 2>&1; then
+          echo "✅⚠️✅ Already exists in destination → skipping copy"
+          SKIP_COPY=true
+        else
+          echo "➡️ Not found in destination → continue"
+        fi
+
+        echo "📂 Checking stage bucket..."
+        if [ "$SKIP_COPY" = "true" ]; then
+          echo "⏭️ Skipped stage check"
+        else
+          if aws s3 ls s3://$STAGE_BUCKET/$STAGE_PREFIX/$ZIP_FILE >/dev/null 2>&1; then
+            echo "✅ Found in stage bucket"
+          else
+            echo "❌ ERROR: File not found in stage bucket"
+            exit 1
+          fi
+        fi
+
+        echo "📤 Copying artifact..."
+        if [ "$SKIP_COPY" = "true" ]; then
+          echo "⏭️ Copy skipped (already exists)"
+        else
+          aws s3 cp \
+            s3://$STAGE_BUCKET/$STAGE_PREFIX/$ZIP_FILE \
+            s3://$DEST_BUCKET/$DEST_PREFIX/$ZIP_FILE
+
+          echo "✅ Copy to Destination completed"
+        fi
+
+        echo "✅ [BUILD] Completed"
+
+  post_build:
+    commands:
+      - |
+        echo "🚀 [POST_BUILD] Uploading logs..."
+
+        S3_PATH="s3://$LOG_BUCKET/pipeline-logs/$PIPELINE_EXECUTION_ID/$STAGE_NAME/build.log"
+
+        aws s3 cp /tmp/build.log "$S3_PATH"
+
+        echo "📁 Logs uploaded to:"
+        echo "👉 $S3_PATH"
+
+        echo "✅ [POST_BUILD] Completed"

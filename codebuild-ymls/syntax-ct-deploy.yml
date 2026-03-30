@@ -1,0 +1,364 @@
+version: 0.2
+
+env:
+  variables:
+    # default SSM timeout for commands executed on instances
+    SYNTAXCT_SSM_TIMEOUT_SECS: "1800"
+    DEFAULT_REGION: "eu-west-1"
+    ASSUME_ROLE_SESSION: "SyntaxCTDeploySession"
+  exported-variables: []
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.11
+    commands:
+      - echo "📦 Installing dependencies..."
+      - yum install -y jq awscli || echo "⚠️ yum install may require elevated privileges in CodeBuild image"
+      - echo "✅ Install complete"
+
+  build:
+    commands:
+     
+      - |
+        exec > >(stdbuf -oL tee -a /tmp/build.log) 2>&1
+        echo STAGE_NAME=$STAGE_NAME
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [BUILD]📥 Reading task.json from SSM using JIRA_ID=$JIRA_ID"
+        TASK_PARAM_PATH="/rm-flow-controller/${JIRA_ID}/task.json"
+      
+        echo "🔎 SSM path: $TASK_PARAM_PATH"
+      
+        TASK_JSON="$(aws ssm get-parameter \
+          --name "$TASK_PARAM_PATH" \
+          --with-decryption \
+          --query 'Parameter.Value' \
+          --output text \
+          --region "$DEFAULT_REGION")" || true
+        if [[ -z "$TASK_JSON" || "$TASK_JSON" == "None" ]]; then
+          echo "❌ Empty SSM value for $TASK_PARAM_PATH"; exit 1
+        fi
+        printf '%s\n' "$TASK_JSON" > task.json
+        echo "✅ Saved to task.json"; jq . task.json || cat task.json
+
+        # 2) basics + Parameter Store (collect syntax_ct metadata BEFORE assume-role)
+      
+        echo "📌 Extracting metadata..."
+        CLIENT=$(jq -r '.client // empty' task.json)
+        ENV=$(jq -r '.env // empty' task.json)
+        JIRA_ID=$(jq -r '.jira_ticket // empty' task.json || echo "$JIRA_ID")
+        echo "✅ Fields: CLIENT=${CLIENT:-<missing>} ENV=${ENV:-<missing>} JIRA=${JIRA_ID}"
+        if [[ -z "$CLIENT" || -z "$ENV" ]]; then
+          echo "❌ client/env missing in task.json"; exit 1
+        fi
+
+        PARAM_PATH="/arm-cpr/${CLIENT}/${ENV}/details.json"
+        echo "📥 Fetching Parameter Store metadata at $PARAM_PATH"
+        PARAM_JSON="$(aws ssm get-parameter --name "$PARAM_PATH" --with-decryption --query 'Parameter.Value' --output text --region "$DEFAULT_REGION")" || true
+        if [[ -z "$PARAM_JSON" || "$PARAM_JSON" == "None" ]]; then
+          echo "❌ Failed to fetch Parameter Store $PARAM_PATH"; exit 1
+        fi
+        printf '%s\n' "$PARAM_JSON" > /tmp/param_json.json
+        echo "$PARAM_JSON" | jq . >/dev/null
+        echo "✅ Parameter JSON fetched"
+
+        REGION=$(jq -r '.region // empty' /tmp/param_json.json)
+        ROLE_ARN=$(jq -r '.assume_role_arn // empty' /tmp/param_json.json)
+
+        # syntax_ct_details
+        SYNTAX_ENV_ID=$(jq -r '.syntax_ct_details.env_id // empty' /tmp/param_json.json)
+        SYNTAX_ENV_NAME=$(jq -r '.syntax_ct_details.env_name // empty' /tmp/param_json.json)
+        SYNTAX_OBJ_VERSION=$(jq -r '.syntax_ct_details.obj_version // empty' /tmp/param_json.json)
+        SYNTAX_JAVA_PATH=$(jq -r '.syntax_ct_details.java_path // empty' /tmp/param_json.json)
+
+        # normalize values
+        [[ "$REGION" == "null" ]] && REGION=""
+        [[ "$ROLE_ARN" == "null" ]] && ROLE_ARN=""
+
+        if [[ -z "$REGION" || -z "$ROLE_ARN" ]]; then
+          echo "❌ region/assume_role_arn missing in Parameter Store"; exit 1
+        fi
+
+        # warn if syntax_ct details missing
+        if [[ -z "$SYNTAX_ENV_ID" || -z "$SYNTAX_ENV_NAME" || -z "$SYNTAX_OBJ_VERSION" || -z "$SYNTAX_JAVA_PATH" ]]; then
+          echo "⚠️ One or more syntax_ct_details keys missing in Parameter Store. SYNTAX-CT deploys may fail."
+        else
+          echo "✅ syntax_ct_details present"
+        fi
+
+        # 3) Select single SYNTAX-CT deploy item based on TASK_INDEX (must be provided)
+      
+        echo "🎯 Selecting single SYNTAX-CT deploy item (TASK_INDEX=${TASK_INDEX:-<unset>})..."
+        if [[ -z "${TASK_INDEX:-}" ]]; then
+          echo "❌ TASK_INDEX not provided. This build processes a single syntax-ct item by TASK_INDEX (zero-based)."; exit 1
+        fi
+
+        if ! echo "$TASK_INDEX" | grep -Eq '^[0-9]+$'; then
+          echo "❌ TASK_INDEX must be numeric: ${TASK_INDEX}"; exit 1
+        fi
+
+        DEPLOY_COUNT=$(jq '.deploy | length' task.json 2>/dev/null || echo 0)
+        if [ "$TASK_INDEX" -ge "$DEPLOY_COUNT" ]; then
+          echo "❌ TASK_INDEX ${TASK_INDEX} out of range (deploy count=${DEPLOY_COUNT})"; exit 1
+        fi
+
+        DEPLOY_ITEM="$(jq -c ".deploy[$TASK_INDEX]" task.json 2>/dev/null || echo "")"
+        if [[ -z "$DEPLOY_ITEM" || "$DEPLOY_ITEM" == "null" ]]; then
+          echo "❌ No deploy[$TASK_INDEX] found in task.json"; exit 1
+        fi
+
+        TASK_TYPE_ACTUAL=$(jq -r '.task_type // empty' <<< "$DEPLOY_ITEM")
+        if ! echo "$TASK_TYPE_ACTUAL" | grep -Ei '^Syntax-CT' >/dev/null; then
+          echo "❌ deploy[$TASK_INDEX].task_type='$TASK_TYPE_ACTUAL' is not a Syntax-CT type; aborting"; exit 1
+        fi
+
+        # extract fields from the selected deploy item
+        SERVER_NAME=$(jq -r '.server_name // .server // empty' <<< "$DEPLOY_ITEM")
+        FILE_NAME=$(jq -r '.file_name // empty' <<< "$DEPLOY_ITEM")
+
+        if [[ -z "$SERVER_NAME" || -z "$FILE_NAME" ]]; then
+          echo "❌ Selected syntax-ct item missing server or file_name"; exit 1
+        fi
+
+        # derive instance id and src_path from parameter json and JIRA
+        SKEY=$(printf '%s' "$SERVER_NAME" | tr '[:upper:]' '[:lower:]')
+        IID=$(jq -r --arg s "$SKEY" '.Instance_mappings[($s + "_instance_id")] // empty' /tmp/param_json.json)
+        SRC_PATH_REMOTE="/tmp/${JIRA_ID}/client-packages/${JIRA_ID}/deploy/${FILE_NAME}"
+        SCRIPT_DIR="/tmp/${JIRA_ID}/scripts"
+
+        # emit a single-item array file to keep downstream logic identical
+        jq -n --arg server_name "$SERVER_NAME" --arg file_name "$FILE_NAME" --arg iid "$IID" --arg src_path "$SRC_PATH_REMOTE" --arg script_dir "$SCRIPT_DIR" '[{server_name:$server_name,file_name:$file_name,iid:$iid,src_path:$src_path,script_dir:$script_dir}]' > syntaxct_deploy_tasks.json || true
+
+        echo "📄 SYNTAX-CT deploy tasks (selected item):"
+        jq . syntaxct_deploy_tasks.json || cat syntaxct_deploy_tasks.json
+        SYNTAXCT_READY=$(jq 'length' syntaxct_deploy_tasks.json 2>/dev/null || echo 0)
+        echo "✅ SYNTAX-CT deploy tasks ready for execution: ${SYNTAXCT_READY}"
+        if [[ "$SYNTAXCT_READY" -eq 0 ]]; then
+          echo "❌ No valid SYNTAX-CT deploy task(s). Nothing to do."; exit 1
+        fi
+
+        # 4) Assume role into client account
+        echo "🔐 Assuming client account role..."
+      
+        CREDS=$(aws sts assume-role --role-arn "$ROLE_ARN" --role-session-name "$ASSUME_ROLE_SESSION" --region "$REGION")
+        if [[ -z "$CREDS" || "$CREDS" == "None" ]]; then
+          echo "❌ assume-role failed"; exit 1
+        fi
+        export AWS_ACCESS_KEY_ID=$(echo "$CREDS" | jq -r '.Credentials.AccessKeyId')
+        export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r '.Credentials.SecretAccessKey')
+        export AWS_SESSION_TOKEN=$(echo "$CREDS" | jq -r '.Credentials.SessionToken')
+        echo "✅ AssumeRole success (region=$REGION)"
+
+        # 5) Process the single syntax-ct task
+      
+        echo "🚀 Executing selected SYNTAX-CT deploy via SSM (artifacts expected on syntax-ct server)..."
+        SUCCESS_LIST=""
+        FAILURE_LIST=""
+
+        ROW=$(jq -c '.[0]' syntaxct_deploy_tasks.json)
+        SERVER_NAME=$(jq -r '.server_name' <<< "$ROW")
+        FILE_NAME=$(jq -r '.file_name' <<< "$ROW")
+        IID=$(jq -r '.iid' <<< "$ROW")
+        SRC_PATH_REMOTE=$(jq -r '.src_path' <<< "$ROW")
+        SCRIPT_DIR=$(jq -r '.script_dir' <<< "$ROW")
+
+        echo "----------------------------------------"
+        echo "🏷️  Server: $SERVER_NAME"
+        echo "📄 Syntax-CT file: $FILE_NAME"
+        echo "🖥️  Syntax-CT instance: $IID"
+        echo "📦 Expected remote source path on syntax-ct server: $SRC_PATH_REMOTE"
+        echo "📜 Remote script dir: $SCRIPT_DIR"
+
+        # validate instance mapping
+        if [[ -z "$IID" || "$IID" == "null" ]]; then
+          echo "❌ No instance mapping for syntax-ct server '$SERVER_NAME'"; exit 1
+        fi
+
+        # -------------------------------------------------------------------------
+        # Build commands_syntaxct_deploy.json template
+        # -------------------------------------------------------------------------
+        cat > commands_syntaxct_deploy.json <<'JSON_TPL'
+        {
+            "commands": [
+              "set -euo pipefail",
+              "mkdir -p /tmp/__JIRA__/syntaxct_deploy",
+              "UTIL_SUB=$(ls -1 /tmp/__JIRA__/utilities/syntax-ct/installer 2>/dev/null | grep -E '^installer' | head -n1 | tr -d '\\r' | sed 's/[[:space:]]*$//' || true)",
+              "echo \"DEBUG: UTIL_SUB=[$UTIL_SUB] (len=$(echo -n $UTIL_SUB | wc -c))\"",
+              "if [[ -n \"$UTIL_SUB\" ]]; then UTIL_PATH=\"/tmp/__JIRA__/utilities/syntax-ct/installer/$UTIL_SUB\"; else UTIL_PATH=\"/tmp/__JIRA__/utilities/syntax-ct/installer\"; fi",
+              "echo \"DEBUG: UTIL_PATH=[$UTIL_PATH]\"",
+              "TARGET_FILE=/tmp/__JIRA__/syntaxct_deploy/__FILE__",
+              "SRC_FILE=/tmp/__JIRA__/client-packages/__JIRA__/deploy/__FILE__",
+              "echo \"Using UTIL_PATH=$UTIL_PATH SRC_FILE=$SRC_FILE TARGET_FILE=$TARGET_FILE\"",
+              "if [[ -f \"$SRC_FILE\" ]]; then cp -f \"$SRC_FILE\" \"$TARGET_FILE\"; else echo \"❌ Artifact not found on syntax-ct server at $SRC_FILE\"; exit 3; fi",
+              "/tmp/__JIRA__/scripts/deploy-syntaxctimport.sh \"$UTIL_PATH\" \"$TARGET_FILE\" \"__ENV_ID__\" \"__ENV_NAME__\" \"__JAVA_PATH__\"",
+              "if [[ -f \"$TARGET_FILE\" ]]; then echo \"✅ Syntax-CT deploy file exists: $TARGET_FILE\"; else echo \"⚠️ Syntax-CT deploy file not found: $TARGET_FILE\"; exit 3; fi"
+            ]
+        }
+        JSON_TPL
+
+        # placeholder replacement
+        sed -e "s|__JIRA__|${JIRA_ID}|g" \
+            -e "s|__FILE__|${FILE_NAME}|g" \
+            -e "s|__ENV_ID__|${SYNTAX_ENV_ID}|g" \
+            -e "s|__ENV_NAME__|${SYNTAX_ENV_NAME}|g" \
+            -e "s|__JAVA_PATH__|${SYNTAX_JAVA_PATH}|g" \
+            commands_syntaxct_deploy.json > commands_syntaxct_deploy.json.tmp && mv commands_syntaxct_deploy.json.tmp commands_syntaxct_deploy.json
+
+        echo
+        echo "🔍 Debug (RAW variables):"
+        echo "  JIRA_ID: ${JIRA_ID}"
+        echo "  FILE_NAME: ${FILE_NAME}"
+        echo "  IID: ${IID}"
+        echo "  SYNTAX_ENV_ID: ${SYNTAX_ENV_ID}"
+        echo "  SYNTAX_ENV_NAME: ${SYNTAX_ENV_NAME}"
+        echo "  SYNTAX_JAVA_PATH: ${SYNTAX_JAVA_PATH}"
+        echo
+
+        echo "🔎 Validate generated commands_syntaxct_deploy.json is valid JSON"
+        if ! jq -e . commands_syntaxct_deploy.json >/dev/null 2>&1; then
+          echo "❌ commands_syntaxct_deploy.json invalid JSON (preview):"
+          cat commands_syntaxct_deploy.json || true
+          exit 1
+        else
+          echo "✅ commands_syntaxct_deploy.json is valid JSON"
+        fi
+
+        echo "📋 Preview commands_syntaxct_deploy.json content (RAW):"
+        echo "####### cmd sending ###################"
+        cat commands_syntaxct_deploy.json
+        echo
+
+        # Send SSM command to syntax-ct instance
+        echo "📨 Sending SSM command to syntax-ct instance ${IID}..."
+        SYNTAXCT_CMD_ID=$(aws ssm send-command \
+          --document-name "AWS-RunShellScript" \
+          --instance-ids "${IID}" \
+          --comment "syntaxct-deploy for ${FILE_NAME}" \
+          --parameters file://commands_syntaxct_deploy.json \
+          --region "$REGION" \
+          --query 'Command.CommandId' --output text) || true
+
+        if [[ -z "$SYNTAXCT_CMD_ID" || "$SYNTAXCT_CMD_ID" == "None" ]]; then
+          echo "❌ Failed to send syntaxct-deploy command to ${IID}"; exit 1
+        fi
+
+        # --- Robust polling loop to wait for SSM command to finish ---
+        echo "⏳ Waiting for syntaxct-deploy SSM command (${SYNTAXCT_CMD_ID}) (polling)..."
+
+        : "${SYNTAXCT_SSM_TIMEOUT_SECS:=1800}"
+        TIMEOUT_SECS=${SYNTAXCT_SSM_TIMEOUT_SECS}
+        INTERVAL=5
+        START_TS=$(date +%s)
+        END_TS=$((START_TS + TIMEOUT_SECS))
+
+        _fetch_invocation() {
+          aws ssm get-command-invocation \
+            --command-id "${SYNTAXCT_CMD_ID}" \
+            --instance-id "${IID}" \
+            --region "${REGION}" \
+            --output json 2>/dev/null || true
+        }
+
+        LAST_STATUS=""
+        RAW_OUT_SYNTAXCT=""
+        while true; do
+          NOW=$(date +%s)
+          if (( NOW > END_TS )); then
+            echo "❌ Timeout reached waiting for command ${SYNTAXCT_CMD_ID} (waited ${TIMEOUT_SECS}s)"
+            RAW_OUT_SYNTAXCT=$(_fetch_invocation)
+            SYNTAXCT_STATUS=$(printf '%s' "$RAW_OUT_SYNTAXCT" | jq -r '.Status // empty')
+            SYNTAXCT_STDOUT=$(printf '%s' "$RAW_OUT_SYNTAXCT" | jq -r '.StandardOutputContent // ""')
+            SYNTAXCT_STDERR=$(printf '%s' "$RAW_OUT_SYNTAXCT" | jq -r '.StandardErrorContent // ""')
+            echo "Last known status: ${SYNTAXCT_STATUS}"
+            break
+          fi
+
+          RAW_OUT_SYNTAXCT=$(_fetch_invocation)
+
+          if [[ -z "$RAW_OUT_SYNTAXCT" || "$RAW_OUT_SYNTAXCT" == "null" ]]; then
+            echo "waiting for invocation to be available..."
+            sleep $INTERVAL
+            continue
+          fi
+
+          SYNTAXCT_STATUS=$(printf '%s' "$RAW_OUT_SYNTAXCT" | jq -r '.Status // empty')
+          SYNTAXCT_STDOUT=$(printf '%s' "$RAW_OUT_SYNTAXCT" | jq -r '.StandardOutputContent // ""')
+          SYNTAXCT_STDERR=$(printf '%s' "$RAW_OUT_SYNTAXCT" | jq -r '.StandardErrorContent // ""')
+
+          if [[ "$SYNTAXCT_STATUS" != "$LAST_STATUS" ]]; then
+            echo "📄 syntaxct-deploy Status: ${SYNTAXCT_STATUS} (at $(date -u +%T))"
+            LAST_STATUS="$SYNTAXCT_STATUS"
+          else
+            printf "."
+          fi
+
+          if [[ -n "$SYNTAXCT_STDOUT" ]]; then
+            echo
+            echo "---- StandardOutput (so far) ----"
+            printf '%s\n' "$SYNTAXCT_STDOUT"
+          fi
+          if [[ -n "$SYNTAXCT_STDERR" ]]; then
+            echo
+            echo "---- StandardError (so far) ----"
+            printf '%s\n' "$SYNTAXCT_STDERR"
+          fi
+
+          case "$SYNTAXCT_STATUS" in
+            Success|Failed|Cancelled|TimedOut|DeliveryTimedOut)
+              echo
+              echo "⏱️ Command reached terminal state: ${SYNTAXCT_STATUS}"
+              break
+              ;;
+            InProgress|Pending|Delayed|Cancelling)
+              sleep $INTERVAL
+              continue
+              ;;
+            *)
+              sleep $INTERVAL
+              continue
+              ;;
+          esac
+        done
+
+        # ensure we have final values
+        if [[ -z "${SYNTAXCT_STATUS:-}" || "${SYNTAXCT_STATUS}" == "null" ]]; then
+          RAW_OUT_SYNTAXCT=$(_fetch_invocation)
+          SYNTAXCT_STATUS=$(printf '%s' "$RAW_OUT_SYNTAXCT" | jq -r '.Status // empty')
+          SYNTAXCT_STDOUT=$(printf '%s' "$RAW_OUT_SYNTAXCT" | jq -r '.StandardOutputContent // ""')
+          SYNTAXCT_STDERR=$(printf '%s' "$RAW_OUT_SYNTAXCT" | jq -r '.StandardErrorContent // ""')
+        fi
+
+        echo "Final syntaxct-deploy Status: ${SYNTAXCT_STATUS}"
+        printf '%s\n' "$SYNTAXCT_STDOUT"
+        if [[ -n "$SYNTAXCT_STDERR" ]]; then
+          echo "🪵 syntaxct-deploy Stderr:"; printf '%s\n' "$SYNTAXCT_STDERR"
+        fi
+
+        # Determine success: require SSM Status == Success and no obvious error strings in stdout/stderr
+        if [[ "$SYNTAXCT_STATUS" == "Success" ]] && ! (printf '%s\n' "$SYNTAXCT_STDERR" | grep -Eiq 'error|failed|exception|traceback'); then
+          echo "✅ SYNTAX-CT deploy succeeded for ${SERVER_NAME}:${FILE_NAME}"
+        else
+          echo "❌ SYNTAX-CT deploy FAILED for ${SERVER_NAME}:${FILE_NAME} (status=${SYNTAXCT_STATUS})"; exit 1
+        fi
+
+  post_build:
+    commands:
+      - |
+        echo "Resetting AWS credentials to CodeBuild role..."
+
+        unset AWS_ACCESS_KEY_ID
+        unset AWS_SECRET_ACCESS_KEY
+        unset AWS_SESSION_TOKEN
+        
+        exec > >(stdbuf -oL tee -a /tmp/build.log) 2>&1
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [POST_BUILD] UPLOADING_LOGS"
+
+        # Use parent execution ID if passed, otherwise use own
+        EXEC_FOLDER="${PARENT_EXECUTION_ID:-$PIPELINE_EXECUTION_ID}"
+
+        S3_PATH="s3://nonprod-release-management-codebuild-logs/pipeline-logs/$EXEC_FOLDER/$STAGE_NAME/build.log"
+        aws s3 cp /tmp/build.log "$S3_PATH"
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [POST_BUILD] LOGS_UPLOADED_TO=$S3_PATH"
+
+artifacts:
+  files:
+    - '**/*'

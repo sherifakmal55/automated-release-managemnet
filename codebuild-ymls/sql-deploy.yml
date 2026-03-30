@@ -1,0 +1,228 @@
+version: 0.2
+
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.11
+    commands:
+      - echo "📦 Installing dependencies..."
+      - yum install -y jq awscli || true
+      - echo "✅ Install complete"
+
+  build:
+    commands:
+      - | 
+        exec > >(stdbuf -oL tee -a /tmp/build.log) 2>&1
+        echo STAGE_NAME=$STAGE_NAME
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [BUILD]📥 Reading task.json from SSM using JIRA_ID=$JIRA_ID"
+        TASK_PARAM_PATH="/rm-flow-controller/${JIRA_ID}/task.json"
+      
+        echo "🔎 SSM path: $TASK_PARAM_PATH"
+      
+        TASK_JSON="$(aws ssm get-parameter \
+          --name "$TASK_PARAM_PATH" \
+          --with-decryption \
+          --query 'Parameter.Value' \
+          --output text \
+          --region eu-west-1)" || true
+        if [[ -z "$TASK_JSON" || "$TASK_JSON" == "None" ]]; then
+          echo "❌ Empty SSM value for $TASK_PARAM_PATH"; exit 1
+        fi
+        printf '%s\n' "$TASK_JSON" > task.json
+        echo "✅ Saved to task.json"; jq . task.json || cat task.json
+
+      
+        echo "📌 Extracting metadata..."
+        CLIENT=$(jq -r '.client' task.json)
+        ENV=$(jq -r '.env' task.json)
+        JIRA_ID=$(jq -r '.jira_ticket' task.json)
+
+        echo "📥 Fetching Parameter Store JSON..."
+        PARAM_PATH="/arm-cpr/$CLIENT/$ENV/details.json"
+        PARAM_JSON=$(aws ssm get-parameter --name "$PARAM_PATH" --with-decryption --query 'Parameter.Value' --output text)
+
+        REGION=$(echo "$PARAM_JSON" | jq -r '.region')
+        ROLE_ARN=$(echo "$PARAM_JSON" | jq -r '.assume_role_arn')
+        INSTANCE_ID=$(echo "$PARAM_JSON" | jq -r '.task_type_mappings.sqlserver_instance_id')
+        ORACLE_HOST=$(echo "$PARAM_JSON" | jq -r '.database_details.oracle_host')
+        ORACLE_PORT=$(echo "$PARAM_JSON" | jq -r '.database_details.oracle_port')
+        ORACLE_SID=$(echo "$PARAM_JSON" | jq -r '.database_details.oracle_sid')
+        ORACLE_USER=$(echo "$PARAM_JSON" | jq -r '.database_details.oracle_user')
+        SECRET_ARN=$(echo "$PARAM_JSON" | jq -r '.database_details.secret_arn')
+        ORACLE_PATH=$(echo "$PARAM_JSON" | jq -r '.database_details.oracle_path')
+
+        if [[ -z "$REGION" || -z "$ROLE_ARN" ]]; then
+          echo "❌ region or assume_role_arn missing from Parameter Store ($PARAM_PATH)"; exit 1
+        fi
+
+        # Assume role to fetch secret (short-lived)
+        echo "🔐 Temporary assume-role to fetch secret..."
+        ASSUME_ROLE_OUTPUT=$(aws sts assume-role \
+          --role-arn "$ROLE_ARN" \
+          --role-session-name "CodeBuildSecretFetch" \
+          --region "$REGION")
+        export AWS_ACCESS_KEY_ID=$(echo "$ASSUME_ROLE_OUTPUT" | jq -r '.Credentials.AccessKeyId')
+        export AWS_SECRET_ACCESS_KEY=$(echo "$ASSUME_ROLE_OUTPUT" | jq -r '.Credentials.SecretAccessKey')
+        export AWS_SESSION_TOKEN=$(echo "$ASSUME_ROLE_OUTPUT" | jq -r '.Credentials.SessionToken')
+
+        SECRET_JSON=$(aws secretsmanager get-secret-value \
+          --secret-id "$SECRET_ARN" \
+          --region "$REGION" \
+          --query "SecretString" \
+          --output text)
+
+        ORACLE_PASS=$(echo "$SECRET_JSON" | jq -r '.password')
+        if [[ -z "$ORACLE_PASS" || "$ORACLE_PASS" == "null" ]]; then
+          echo "❌ Could not extract password from secret ($SECRET_ARN)"; exit 1
+        fi
+        echo "✅ Oracle password retrieved (hidden)"
+
+        # Unset temporary temp creds used for secret fetch
+        unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+
+        echo "🔐 Assuming client account role for SSM commands..."
+        CREDS=$(aws sts assume-role --role-arn "$ROLE_ARN" --role-session-name Stage5DeploySession --region "$REGION")
+        export AWS_ACCESS_KEY_ID=$(echo "$CREDS" | jq -r '.Credentials.AccessKeyId')
+        export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r '.Credentials.SecretAccessKey')
+        export AWS_SESSION_TOKEN=$(echo "$CREDS" | jq -r '.Credentials.SessionToken')
+
+      
+        echo "🔍 Building SQL task list (respecting TASK_TYPE if provided)..."
+        # If TASK_TYPE is provided (e.g. DatabaseSql2) -> select only that task_type (case-insensitive)
+        if [[ -n "${TASK_TYPE:-}" ]]; then
+          echo "ℹ️ TASK_TYPE provided: ${TASK_TYPE}. Will select only that task_type."
+          SQL_TASKS=$(jq -c --arg tt "$TASK_TYPE" '[.deploy[] | select((.task_type // "" | ascii_downcase) == ($tt | ascii_downcase))]' task.json)
+        else
+          echo "ℹ️ No TASK_TYPE provided. Will select all DatabaseSql* tasks (DatabaseSql, DatabaseSql1, DatabaseSql2...)."
+          SQL_TASKS=$(jq -c '[.deploy[] | select(.task_type | test("^DatabaseSql[0-9]*$"; "i"))]' task.json)
+        fi
+
+        # Count tasks
+        SQL_COUNT=$(echo "$SQL_TASKS" | jq 'length')
+        if [ "$SQL_COUNT" -eq 0 ]; then
+          echo "⚠️ No matching DatabaseSql tasks found. Skipping."
+          # clean up creds before exit
+          unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+          exit 0
+        fi
+        echo "✅ Found $SQL_COUNT SQL task(s) to process."
+
+        SUCCESS_LIST=""
+        FAILURE_LIST=""
+
+        # Iterate each task
+        while read -r TASK; do
+          # tolerant file key detection: sql_package || sql_file || file_name
+          SQL_FILE=$(echo "$TASK" | jq -r '(.sql_package // .sql_file // .file_name // "")')
+          if [[ -z "$SQL_FILE" ]]; then
+            echo "⚠️ Task missing sql file field; skipping task: $(echo "$TASK" | jq -c '.')" 
+            FAILURE_LIST="$FAILURE_LIST\n<missing_file_entry>"
+            continue
+          fi
+
+          FULL_PATH="/tmp/$JIRA_ID/client-packages/$JIRA_ID/deploy/$SQL_FILE"
+          SCRIPT_PATH="/tmp/$JIRA_ID/scripts/deploy-sqltask.sh"
+
+          echo "----------------------------------------"
+          echo "🚀 Deploying SQL file: $SQL_FILE"
+          echo "📄 Remote SQL Path (on instance): $FULL_PATH"
+          echo "📜 Script to run: $SCRIPT_PATH"
+
+          # Compose SSM command to run on instance - ensure it's safely quoted for AWS CLI
+          SSM_CMD="sh $SCRIPT_PATH $ORACLE_HOST $ORACLE_PORT $ORACLE_SID $ORACLE_USER "$ORACLE_PASS" $FULL_PATH $ORACLE_PATH"
+
+          # Send SSM command
+          CMD_ID=$(aws ssm send-command \
+            --region "$REGION" \
+            --document-name "AWS-RunShellScript" \
+            --instance-ids "$INSTANCE_ID" \
+            --comment "Running ${TASK_TYPE:-DatabaseSql} for $SQL_FILE" \
+            --parameters "commands=['$SSM_CMD']" \
+            --query "Command.CommandId" \
+            --output text) || true
+
+          if [[ -z "$CMD_ID" || "$CMD_ID" == "None" ]]; then
+            echo "❌ Failed to start SSM command for $SQL_FILE"
+            FAILURE_LIST="$FAILURE_LIST\n$SQL_FILE (send-command failed)"
+            continue
+          fi
+
+          echo "⏳ Waiting 10s before polling SSM (CommandId=$CMD_ID)..."
+          sleep 10
+
+          # Poll SSM once for status
+          STATUS=$(aws ssm list-command-invocations \
+            --region "$REGION" \
+            --command-id "$CMD_ID" \
+            --details \
+            --query "CommandInvocations[0].Status" \
+            --output text)
+
+          echo "📄 Fetching logs for $SQL_FILE (CommandId=$CMD_ID)"
+          LOGS=$(aws ssm get-command-invocation \
+            --region "$REGION" \
+            --command-id "$CMD_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --query "StandardOutputContent" \
+            --output text 2>/dev/null || true)
+
+          STDERR=$(aws ssm get-command-invocation \
+            --region "$REGION" \
+            --command-id "$CMD_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --query "StandardErrorContent" \
+            --output text 2>/dev/null || true)
+
+          echo "----- STDOUT for $SQL_FILE -----"
+          echo "$LOGS"
+          echo "----- STDERR for $SQL_FILE -----"
+          echo "$STDERR"
+
+          if [[ "$STATUS" == "Success" ]] && ! echo "$STDERR" | grep -Eiq 'error|failed|exception|traceback'; then
+            echo "✅ Success: $SQL_FILE"
+            SUCCESS_LIST="$SUCCESS_LIST\n$SQL_FILE"
+          else
+            echo "❌ Failure: $SQL_FILE (status=$STATUS)"
+            FAILURE_LIST="$FAILURE_LIST\n$SQL_FILE (status=$STATUS)"
+          fi
+
+        done < <(echo "$SQL_TASKS" | jq -c '.[]')
+
+      
+        echo "========================================"
+        echo "🎯 SQL Deployment Summary (JIRA=${JIRA_ID})"
+        printf '✅ Successful files:\n%s\n' "${SUCCESS_LIST:-<none>}"
+        printf '❌ Failed files:\n%s\n' "${FAILURE_LIST:-<none>}"
+        echo "========================================"
+
+        # Unset assumed creds
+        unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+
+        if [[ -n "${FAILURE_LIST// }" ]] && [[ "${FAILURE_LIST// }" != "<none>" ]]; then
+          echo "❌ One or more SQL deployments failed."
+          exit 1
+        fi
+  
+  post_build:
+    commands:
+      - |
+        echo "Resetting AWS credentials to CodeBuild role..."
+
+        unset AWS_ACCESS_KEY_ID
+        unset AWS_SECRET_ACCESS_KEY
+        unset AWS_SESSION_TOKEN
+        
+        exec > >(stdbuf -oL tee -a /tmp/build.log) 2>&1
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [POST_BUILD] UPLOADING_LOGS"
+
+        # Use parent execution ID if passed, otherwise use own
+        EXEC_FOLDER="${PARENT_EXECUTION_ID:-$PIPELINE_EXECUTION_ID}"
+
+        S3_PATH="s3://nonprod-release-management-codebuild-logs/pipeline-logs/$EXEC_FOLDER/$STAGE_NAME/build.log"
+        aws s3 cp /tmp/build.log "$S3_PATH"
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [POST_BUILD] LOGS_UPLOADED_TO=$S3_PATH"
+
+artifacts:
+  files:
+    - '**/*'

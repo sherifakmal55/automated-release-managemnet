@@ -1,0 +1,68 @@
+version: 0.2
+
+env:
+  shell: bash
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.11
+    commands:
+      - yum install -y coreutils || true
+      - |
+        exec > >(stdbuf -oL tee -a /tmp/build.log) 2>&1
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [INSTALL] INSTALL_PHASE_STARTED"
+        pip --version || true
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [INSTALL] PIPELINE_EXECUTION_ID=$PIPELINE_EXECUTION_ID"
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [INSTALL] STAGE_NAME=$STAGE_NAME"
+
+  build:
+    commands:
+      - |
+        exec > >(stdbuf -oL tee -a /tmp/build.log) 2>&1
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [BUILD] BUILD_STARTED"
+
+        REPO=gn-release-management
+        BRANCH=non-prod
+        REGION=eu-west-1
+
+        latest_commit=$(aws codecommit get-branch --repository-name $REPO --branch-name $BRANCH --region $REGION --query branch.commitId --output text)
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [BUILD] LATEST_COMMIT=$latest_commit"
+
+        parent_commit=$(aws codecommit get-commit --repository-name $REPO --commit-id $latest_commit --region $REGION --query commit.parents[0] --output text)
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [BUILD] PARENT_COMMIT=$parent_commit"
+
+        changed_files=$(aws codecommit get-differences --repository-name $REPO --before-commit-specifier $parent_commit --after-commit-specifier $latest_commit --query "differences[?changeType=='A' || changeType=='M'].afterBlob.path" --region $REGION --output text | tr '\t' '\n' | grep -E 'OND-.*\.json$' || true)
+
+        if [ -z "$changed_files" ]; then
+          echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [BUILD] ERROR No changed files found"
+          exit 1
+        fi
+
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [BUILD] CHANGED_FILES=$changed_files"
+
+        FILE=$(echo "$changed_files" | head -n 1)
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [BUILD] PROCESSING_FILE=$FILE"
+
+        aws codecommit get-file --repository-name $REPO --commit-specifier $latest_commit --file-path $FILE --region $REGION --query fileContent --output text | base64 -d > task.json
+
+        python validate_json.py
+
+        mkdir -p ValidatedOutput
+        cp task.json ValidatedOutput/task.json
+
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [BUILD] BUILD_COMPLETED"
+
+  post_build:
+    commands:
+      - |
+        exec > >(stdbuf -oL tee -a /tmp/build.log) 2>&1
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [POST_BUILD] UPLOADING_LOGS"
+        S3_PATH="s3://nonprod-release-management-codebuild-logs/pipeline-logs/$PIPELINE_EXECUTION_ID/$STAGE_NAME/build.log"
+        aws s3 cp /tmp/build.log "$S3_PATH"
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [POST_BUILD] LOGS_UPLOADED_TO=$S3_PATH"
+
+artifacts:
+  files:
+    - ValidatedOutput/task.json
+  discard-paths: yes
